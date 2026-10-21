@@ -210,6 +210,75 @@ Output mới ở `outputs/comparisons/comparison-<timestamp>-<unique-id>/` gồm
 
 `observed_keyword_signal_order` chỉ sắp theo mean trên cùng joint-export scale; không dùng catalog counts, `numFound` hoặc edition count. Commercial gate kiểm tra phạm vi bằng chứng: các nguồn hiện có chưa cung cấp giá retail, sales, customer reviews hoặc cạnh tranh/availability Hoa Kỳ đã xác minh, nên trả `INSUFFICIENT_EVIDENCE`, `market_opportunity_rank=null` và tối đa ba `RESEARCH_PRIORITY`. Lượng search index/candidate lớn vẫn không mở gate. Chưa có scoring contract/source thương mại để hỗ trợ `RANKABLE`; cần bổ sung bằng chứng phù hợp trước khi triển khai nhánh ranking này. Không điền điểm trung tính hoặc tạo Top 3 thương mại. `analysis_status=DETERMINISTIC_COMPARISON`, inference `NOT_REQUESTED`, claim validation `NOT_RUN`.
 
+## Persistent local jobs — Milestone 3.1
+
+M3.1 chỉ bổ sung hạ tầng job SQLite và worker Python độc lập. Chưa có nút chạy research trong Streamlit và chưa nối job với collector, Ollama, comparison hoặc validator. Loại job duy nhất là `smoke`: kiểm tra hạ tầng offline, tạo `TEST_SMOKE` JSON với `market_validation=NOT_APPLICABLE`, không phải evidence hay research report. Job type chưa triển khai bị từ chối; payload không cho phép command, module, credential, đường dẫn hoặc text tùy ý. Không có thread, worker hay database được khởi tạo chỉ vì import module.
+
+Database mặc định: `outputs/jobs/jobs.sqlite3`; artifact: `outputs/jobs/artifacts/<job-id>/smoke.json`. Cả hai nằm trong `outputs/` đã bị Git ignore, tách khỏi batch/comparison/golden cũ. Mỗi job có UUID 32 ký tự hex và thư mục mới, không dùng lại thư mục có sẵn. Có thể đổi `--db` và `--artifact-dir` trước subcommand; nếu không chỉ định artifact root thì dùng `<thư-mục-db>/artifacts`. Chỉ dùng SQLite trên ổ đĩa cục bộ. Artifact root được lưu cùng DB; mở cùng DB với root khác sẽ bị từ chối. Khi chọn vị trí tùy chỉnh, giữ runtime data ngoài Git.
+
+Schema v1 gồm ba bảng: `jobs` chứa request JSON đã kiểm tra/không thể sửa, state, UTC timestamps tạo/bắt đầu/kết thúc/cancel-request, phase, số bước hoàn tất/tổng số bước, safe error code/message, relative artifact reference, attempt count, provenance và worker ID; `workers` lưu UUID chủ sở hữu, heartbeat, lease expiry và thời gian dừng; `settings` lưu schema version và artifact root. SQLite dùng WAL, transaction `BEGIN IMMEDIATE`, foreign keys và trigger bảo vệ request/state transition. Lock contention chờ tối đa 2 giây mỗi thao tác rồi báo `StoreBusy`; không tự chạy lại handler.
+
+| Trạng thái hiện tại | Chuyển trạng thái được phép |
+| --- | --- |
+| `QUEUED` | Worker claim → `RUNNING`; yêu cầu hủy → `CANCELLED` |
+| `RUNNING` | Handler thành công và có artifact an toàn → `COMPLETED`; lỗi → `FAILED`; xác nhận hủy → `CANCELLED`; dừng/mất lease → `INTERRUPTED` |
+| `COMPLETED`, `FAILED`, `CANCELLED`, `INTERRUPTED` | Terminal; không trở lại queue |
+
+`COMPLETED` chỉ nói handler thực thi xong và artifact tồn tại/không rỗng trong đúng thư mục job; không đồng nghĩa evidence hoặc market analysis `VALID`. Tiến độ là số bước handler thực sự hoàn tất, không ước lượng phần trăm. Exception text/traceback không được lưu hoặc in bởi runner; lỗi có code/message cố định cùng phase để chẩn đoán mà không lộ credential.
+
+**PowerShell smoke test:** chạy từ repository, dùng môi trường Python hiện có. Các lệnh này tạo TEST/SMOKE artifacts, không gọi mạng hoặc model:
+
+```powershell
+$python = Join-Path $PWD '.venv\Scripts\python.exe'
+$job = & $python -m market_research.jobs submit-smoke --steps 3 | ConvertFrom-Json
+& $python -m market_research.jobs list
+& $python -m market_research.jobs inspect $job.job_id
+& $python -m market_research.jobs worker --once
+& $python -m market_research.jobs inspect $job.job_id
+```
+
+Worker `--once` xử lý tối đa một job rồi thoát; queue rỗng không phải lỗi. Exit code: 0 khi thành công/queue rỗng, 1 nếu job vừa xử lý kết thúc khác `COMPLETED`, 2 nếu lệnh/input/database không hợp lệ hoặc đang bận. Xem cú pháp bằng `python -m market_research.jobs --help`. Để thử bằng DB riêng:
+
+```powershell
+& $python -m market_research.jobs --db .\.tmp\m31-smoke\jobs.sqlite3 submit-smoke
+& $python -m market_research.jobs --db .\.tmp\m31-smoke\jobs.sqlite3 worker --once
+& $python -m market_research.jobs --db .\.tmp\m31-smoke\jobs.sqlite3 list
+```
+
+Để worker tiếp tục chờ queue trong terminal riêng, dùng lệnh sau; Streamlit không cần mở:
+
+```powershell
+& $python -m market_research.jobs worker --poll-seconds 2
+```
+
+Worker xử lý tuần tự; polling chỉ nhận giá trị 0.1–60 giây và dùng event wait khi queue rỗng. UUID worker và lease được kiểm tra khi claim/progress/finish; mỗi job chỉ có một chủ sở hữu và mỗi worker chỉ có một job `RUNNING`. Heartbeat thread gia hạn lease 30 giây mỗi 10 giây, độc lập với việc handler báo tiến độ. Worker mới không đánh dấu job còn lease là stale. Ctrl+C/SIGTERM yêu cầu dừng hợp tác; handler phải gọi checkpoint giữa các phase, worker cũng kiểm tra trước/sau handler. Không cưỡng chế kill thread đang làm việc.
+
+Hủy job chưa chạy hoặc yêu cầu hủy job đang chạy:
+
+```powershell
+$cancelJob = & $python -m market_research.jobs submit-smoke | ConvertFrom-Json
+& $python -m market_research.jobs cancel $cancelJob.job_id
+& $python -m market_research.jobs inspect $cancelJob.job_id
+```
+
+Hủy `QUEUED` kết thúc ngay và không claim được nữa. Hủy `RUNNING` chỉ lưu yêu cầu, giữ `RUNNING` tới checkpoint hoặc lúc handler trở về; artifact một phần vẫn có thể tồn tại và không được công bố như result. Yêu cầu hủy thắng completion nếu đã được lưu trước terminal transaction. Nếu handler ném lỗi thật, trạng thái là `FAILED`; terminal job không nhận hủy thêm.
+
+Nếu worker bị kill/mất điện, job có thể còn `RUNNING` đến khi lease hết hạn và worker/lệnh recovery đối chiếu DB. Recovery chỉ chuyển các job có owner đã dừng hoặc hết lease sang `INTERRUPTED`, giữ attempt count và output một phần, không enqueue hay replay. Có thể chạy kiểm tra thủ công:
+
+```powershell
+& $python -m market_research.jobs recover
+```
+
+Lease hết hạn là tín hiệu mất quyền sở hữu, không chứng minh process đã chết: máy bị pause, đồng hồ đổi hoặc SQLite bị khóa lâu cũng có thể làm lease hết. Owner cũ không được gia hạn lease đã hết hoặc ghi trạng thái hoàn tất sau khi bị fence; handler cũ vẫn có thể còn thao tác cho tới checkpoint. Trước khi tự tạo job mới, người dùng phải xác nhận process cũ đã dừng và xem output một phần. M3.1 không hỗ trợ retry tự động hay requeue, kể cả đối với smoke.
+
+**Hợp đồng M3.2:** đăng ký rõ job type/request model mới trong allowlist/schema và một callable `handler(validated_request, context) -> relative_artifact_path`; không import module hoặc chạy shell theo payload. Adapter tái sử dụng `run_research`, `EvidenceStore`, `ExecutionLogger`, models, report writer và validator hiện có. Handler dùng `context.output_dir`, kiểm tra `context.checkpoint()` giữa các thao tác tốn tài nguyên, báo tiến độ thật bằng `context.progress(...)`, chỉ return sau khi các bước pipeline cần thiết và artifact checks hoàn tất, raise nếu thất bại. Không biến state job thành kết luận validation của research. `run_research` hiện còn ghi `snapshots/` và `logs/` theo working directory; M3.2 phải bổ sung path injection theo job cho các output này trước khi nối handler thật. Danh sách phase/typed request và schema version cần được mở rộng có kiểm soát; M3.1 không thay đổi engine hay semantic validator.
+
+Kiểm thử job runner hoàn toàn offline, tạo DB/artifacts trong temp riêng:
+
+```powershell
+& $python -m pytest tests/test_jobs.py -q
+```
+
 ## Dashboard Streamlit — Milestone 2.5
 
 App duy nhất là [dashboard.py](dashboard.py), đọc artifacts có sẵn trong `outputs/`. Không tự chạy batch, collector, comparison generation hoặc Ollama; không ghi database hay sửa report. Giao diện dùng sidebar navy với navigation buttons, workspace sáng, KPI cards/status chips riêng và evidence flow phản ánh đúng execution. HTML từ artifact luôn escape; thiết kế nằm trong `dashboard.css`, màu sidebar dùng theme chính thức, không dùng JS hoặc selector class ngẫu nhiên. Cài dependency UI trên Windows (cần package index hoặc wheelhouse được phép), rồi khởi động từ repository:
