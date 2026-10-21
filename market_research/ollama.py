@@ -9,11 +9,23 @@ from .models import AnalysisDraft, AnalysisGenerationDraft, Plan
 
 
 class OllamaClient:
-    def __init__(self, base_url="http://localhost:11434", model="qwen3:4b-instruct", timeout=90, client=None):
+    def __init__(self, base_url="http://localhost:11434", model="qwen3:4b-instruct", timeout=90, client=None,
+                 checkpoint=None):
         self.base_url, self.model, self.timeout = base_url.rstrip("/"), model, timeout
         self.client = client
         self.last_generation_received = False
         self.last_analysis_request_count = 0
+        self.checkpoint = checkpoint or (lambda: None)
+
+    def _post(self, payload):
+        self.checkpoint()
+        try:
+            if self.client:
+                return self.client.post(f"{self.base_url}/api/generate", json=payload, timeout=self.timeout)
+            with httpx.Client(timeout=self.timeout) as client:
+                return client.post(f"{self.base_url}/api/generate", json=payload)
+        finally:
+            self.checkpoint()
 
     @staticmethod
     def parse_analysis(text: str) -> AnalysisDraft:
@@ -50,7 +62,6 @@ class OllamaClient:
           "Do not infer a seasonal pattern from one annual cycle. Keep claims concise; use the supplied measured keyword verbatim. "
           f"Write generated prose in {report_language}. Research niche: {niche}.\n"
           f"Available fact selections (no canonical IDs): {json.dumps(compact, ensure_ascii=False, separators=(',', ':'))}")
-        client = self.client or httpx.Client(timeout=self.timeout)
         self.last_generation_received = False
         self.last_analysis_request_count = 0
         max_attempts = 1 if correction_diagnostics else 2
@@ -61,7 +72,7 @@ class OllamaClient:
                 request_prompt += ("\nCORRECTION: The previous JSON failed MarketAnalysis validation. Return a complete corrected object. "
                     f"Validation diagnostics: {error_text[:1200]}")
             self.last_analysis_request_count += 1
-            response = client.post(f"{self.base_url}/api/generate", json={"model": self.model, "stream": False,
+            response = self._post({"model": self.model, "stream": False,
                 "format": schema, "options": {"temperature": 0, "num_predict": 1400}, "prompt": request_prompt})
             self.last_generation_received = True
             response.raise_for_status()
@@ -87,13 +98,7 @@ class OllamaClient:
 
     def diagnose(self) -> dict:
         """Perform a small real generation request against the configured local Ollama endpoint."""
-        if self.client:
-            response = self.client.post(f"{self.base_url}/api/generate", json={"model": self.model,
-                "stream": False, "prompt": "Reply with exactly OK."}, timeout=self.timeout)
-        else:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.post(f"{self.base_url}/api/generate", json={"model": self.model,
-                    "stream": False, "prompt": "Reply with exactly OK."})
+        response = self._post({"model": self.model, "stream": False, "prompt": "Reply with exactly OK."})
         response.raise_for_status()
         payload = response.json()
         answer = str(payload.get("response", "")).strip()
@@ -106,8 +111,7 @@ class OllamaClient:
         prompt = ("Return one JSON object with keyword_candidates (1-8 English strings), decisions "
           "(at most 2 objects with tool_name, keyword, rationale), and rationale. Select tool_name only "
           f"from this allowlist: {json.dumps(allowlist)}. Research niche: {niche}. Initial keywords: {json.dumps(candidates)}.")
-        client = self.client or httpx.Client(timeout=self.timeout)
-        response = client.post(f"{self.base_url}/api/generate", json={"model": self.model, "stream": False,
+        response = self._post({"model": self.model, "stream": False,
             "format": "json", "prompt": prompt})
         response.raise_for_status()
         text = response.json().get("response", "")

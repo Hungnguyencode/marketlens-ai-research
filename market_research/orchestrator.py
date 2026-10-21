@@ -1,8 +1,11 @@
 import os
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from typing import Callable
+from urllib.parse import parse_qs, urlparse
 
 from .analysis import (attach_python_direction_reference, build_verified_facts,
     compute_trend_metrics, fallback_analysis, normalize_analysis_keywords)
@@ -18,29 +21,74 @@ from .validator import validate_analysis
 from .trends_csv import GoogleTrendsCsvCollector
 
 
+@dataclass(frozen=True)
+class ResearchExecutionContext:
+    """Optional host adapter; legacy callers retain their original paths and behavior."""
+    root: Path
+    allow_network: bool
+    allow_inference: bool
+    checkpoint: Callable[[], None]
+    progress: Callable[[str, int], None]
+    metadata: dict = field(default_factory=dict)
+
+
 def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: str | None = None,
-                 output_dir="outputs", trends_csv_path: str | None = None, source_url: str | None = None):
+                 output_dir="outputs", trends_csv_path: str | None = None, source_url: str | None = None,
+                 *, execution: ResearchExecutionContext | None = None):
+    check = execution.checkpoint if execution else lambda: None
+    def progress(phase, completed):
+        check()
+        if execution:
+            execution.progress(phase, completed)
+
+    def diagnostic(exc):
+        details = exc.diagnostic() if hasattr(exc, "diagnostic") else {"message": str(exc)}
+        if not execution:
+            return details
+        return {"source": getattr(collector, "source_name", "Google Books API"), "status_code": details.get("status_code")
+                if type(details.get("status_code")) is int else None,
+                "reason": "quota_or_permission_denied" if details.get("status_code") == 403 else
+                          "rate_limited" if details.get("status_code") == 429 else "source_operation_failed",
+                "attempts": details.get("attempts") if type(details.get("attempts")) is int else None,
+                "retry_after_seconds": details.get("retry_after_seconds")
+                if type(details.get("retry_after_seconds")) in (int, float) else None,
+                "message": "Source operation failed; sensitive details withheld."}
+
+    check()
+    if execution:
+        output_dir = execution.root / "reports"
+    if execution and mode == "live" and not execution.allow_network:
+        raise ValueError("Live collection was not authorized.")
     if mode == "csv_import" and (not trends_csv_path or not source_url):
         raise ValueError("csv_import mode requires both trends_csv_path and the actual Google Trends source_url")
     run_id = uuid4().hex[:12]
     started = datetime.now(timezone.utc); tick = time.perf_counter()
-    snap_path = Path("snapshots") / f"{run_id}.json"
+    snap_path = (execution.root if execution else Path(".")) / "snapshots" / f"{run_id}.json"
     store = EvidenceStore(replay_path or snap_path)
-    logger = ExecutionLogger(Path("logs") / f"{run_id}.jsonl", run_id)
+    logger = ExecutionLogger((execution.root if execution else Path(".")) / "logs" / f"{run_id}.jsonl", run_id)
+    progress("PLANNING", 1)
     keywords = [niche]
     if mode == "csv_import":
         collector = GoogleTrendsCsvCollector(trends_csv_path, source_url)
     else:
-        collector = GoogleBooksCollector(config.request_timeout_seconds, os.getenv("GOOGLE_BOOKS_API_KEY"))
+        collector = GoogleBooksCollector(config.request_timeout_seconds, os.getenv("GOOGLE_BOOKS_API_KEY"),
+                                         **({"checkpoint": check} if execution else {}))
     registry = ToolRegistry({collector.name: collector.collect})
-    ollama = OllamaClient(config.ollama_base_url, config.model, config.ollama_timeout_seconds)
-    planner = AgentPlanner(registry.available_tools, llm=ollama.plan if mode == "live" else None)
+    inference_allowed = execution is None or execution.allow_inference
+    ollama = (OllamaClient(config.ollama_base_url, config.model, config.ollama_timeout_seconds,
+                          **({"checkpoint": check} if execution else {})) if inference_allowed else None)
+    planner = AgentPlanner(registry.available_tools, llm=ollama.plan if mode == "live" and ollama else None)
     plan_started = time.perf_counter()
     plan, decision_source = planner.plan(niche, keywords)
     logger.step("plan_research", "AgentPlanner", "fallback" if decision_source.startswith("deterministic_fallback") else "success",
         decision_source, duration=time.perf_counter()-plan_started)
+    progress("COLLECTION", 2)
     if mode == "replay":
         evidence = store.load()
+        check()
+        if execution:
+            store = EvidenceStore(snap_path)
+            store.save(evidence)
         collection_errors = []
         logger.step("load_replay", "EvidenceStore", "success", f"loaded {len(evidence)} saved records")
     else:
@@ -48,6 +96,7 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
         collection_errors = []
         collected_keywords = set()
         for decision in plan.decisions[:config.max_rounds]:
+            check()
             if decision.keyword.casefold() in collected_keywords:
                 logger.step("collect_evidence", decision.tool_name, "skipped", "duplicate keyword request suppressed")
                 continue
@@ -56,13 +105,16 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
             try:
                 rows = registry.call(decision.tool_name, budget=config.tool_call_budget, run_id=run_id, niche=niche,
                     keyword=decision.keyword, target_region=config.target_region)
+                check()
                 evidence.extend(rows)
                 logger.step("collect_evidence", decision.tool_name, "success", f"collected {len(rows)} records", duration=time.perf_counter()-step_started)
             except Exception as exc:
-                diagnostic = exc.diagnostic() if hasattr(exc, "diagnostic") else {"message": str(exc)}
-                collection_errors.append(diagnostic)
+                check()
+                details = diagnostic(exc)
+                collection_errors.append(details)
                 logger.step("collect_evidence", decision.tool_name, "error", "collector failed",
-                    str(diagnostic), time.perf_counter()-step_started)
+                    str(details), time.perf_counter()-step_started)
+        check()
         store = EvidenceStore(snap_path); store.save(evidence)
     quota_403 = collection_errors and all(e.get("status_code") == 403 and
         any(term in (str(e.get("reason", "")) + " " + str(e.get("message", ""))).lower()
@@ -76,6 +128,21 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
     else:
         collection_status = "replay"
 
+    if execution and mode != "live":
+        if len({item.keyword.casefold().strip() for item in evidence}) > 1 or len({item.niche for item in evidence}) > 1:
+            raise ValueError("A single-niche research job requires one local keyword series and niche.")
+        if mode == "csv_import" and evidence:
+            declared = parse_qs(urlparse(source_url).query).get("q", [])
+            normalize = GoogleTrendsCsvCollector._normalized_header
+            if len(declared) != 1 or normalize(declared[0]) != normalize(evidence[0].keyword):
+                raise ValueError("CSV keyword does not match its declared Google Trends source URL.")
+        aliases = {"us", "united states", "hoa kỳ"}
+        if any(item.target_region.casefold() not in aliases or
+               (item.raw_observation.get("geographic_metadata") and
+                GoogleTrendsCsvCollector._normalized_header(item.raw_observation["geographic_metadata"]) not in aliases)
+               for item in evidence):
+            raise ValueError("Local evidence must match the requested United States scope.")
+    progress("EVIDENCE_PREPARATION", 3)
     analysis_started = time.perf_counter()
     ollama_received_evidence = False
     analysis_provenance = "deterministic_fallback"
@@ -83,14 +150,20 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
     analysis_error = None
     computed_metrics = compute_trend_metrics([e.model_dump(mode="json") for e in evidence])
     verified_facts = build_verified_facts([e.model_dump(mode="json") for e in evidence], computed_metrics)
+    progress("MODEL_ANALYSIS" if evidence and inference_allowed else "DETERMINISTIC_ANALYSIS", 4)
     if not evidence:
         analysis = fallback_analysis(niche, [e.model_dump(mode="json") for e in evidence], verified_facts)
         logger.step("analyze_evidence", "OllamaClient", "skipped", "no evidence; no analysis request sent to Ollama",
             duration=time.perf_counter()-analysis_started)
+    elif not inference_allowed:
+        analysis = fallback_analysis(niche, [e.model_dump(mode="json") for e in evidence], verified_facts)
+        analysis_execution_status = "not_requested"
+        logger.step("analyze_evidence", "OllamaClient", "skipped", "inference not authorized; deterministic fallback only")
     else:
         try:
             draft = ollama.analyze(niche, [e.model_dump(mode="json") for e in evidence],
                 config.report_language, computed_metrics=computed_metrics, verified_facts=verified_facts)
+            check()
             if isinstance(draft, MarketAnalysis):
                 draft_data = draft.model_dump(exclude={"factual_observations"})
             elif isinstance(draft, AnalysisDraft):
@@ -104,13 +177,15 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
             logger.step("analyze_evidence", "OllamaClient", "success", f"model={config.model}; evidence_count={len(evidence)}",
                 duration=time.perf_counter()-analysis_started)
         except Exception as exc:
+            check()
             ollama_received_evidence = ollama.last_generation_received
             analysis = fallback_analysis(niche, [e.model_dump(mode="json") for e in evidence], verified_facts)
             analysis_provenance = "deterministic_fallback"
             analysis_execution_status = "failed"
-            analysis_error = f"{type(exc).__name__}: {exc}"
+            analysis_error = "Ollama operation failed; sensitive details withheld." if execution else f"{type(exc).__name__}: {exc}"
             logger.step("analyze_evidence", "OllamaClient", "unavailable", "deterministic low-confidence fallback",
-                str(exc), time.perf_counter()-analysis_started)
+                analysis_error, time.perf_counter()-analysis_started)
+    progress("CLAIM_VALIDATION", 5)
     evidence_dicts = [e.model_dump(mode="json") for e in evidence]
     normalize_analysis_keywords(analysis, evidence_dicts)
     attach_python_direction_reference(analysis, verified_facts)
@@ -128,6 +203,7 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
             corrected_draft = ollama.analyze(niche, [e.model_dump(mode="json") for e in evidence],
                 config.report_language, computed_metrics=computed_metrics, verified_facts=verified_facts,
                 correction_diagnostics=initial_diagnostics)
+            check()
             corrected_data = corrected_draft.model_dump()
             corrected_analysis = MarketAnalysis(**corrected_data,
                 factual_observations=[fact.description for fact in verified_facts])
@@ -144,10 +220,12 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
                 f"one correction pass; final_status={validation.status}; diagnostics={len(validation.unsupported_assertions)}",
                 duration=time.perf_counter()-validation_started)
         except Exception as exc:
-            analysis_recovery.update({"result": "correction_failed", "error": f"{type(exc).__name__}: {exc}",
+            check()
+            correction_error = "Model correction failed; sensitive details withheld." if execution else f"{type(exc).__name__}: {exc}"
+            analysis_recovery.update({"result": "correction_failed", "error": correction_error,
                 "final_diagnostics": initial_diagnostics})
             logger.step("correct_analysis", "OllamaClient", "error", "one correction pass failed; original invalid draft retained",
-                f"{type(exc).__name__}: {exc}", duration=time.perf_counter()-validation_started)
+                correction_error, duration=time.perf_counter()-validation_started)
     elif analysis_provenance == "ollama" and not validation.claims_valid:
         analysis_recovery = {"attempted": False, "result": "bounded_generation_repair_budget_used",
             "initial_diagnostics": list(validation.unsupported_assertions),
@@ -174,10 +252,17 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
         "verified_fact_count": len(verified_facts),
         "evidence_records_received_by_ollama": len(evidence) if ollama_received_evidence else 0,
         "collection_method": "manual_csv_import" if mode == "csv_import" else mode})
+    if execution:
+        result.metadata.update(execution.metadata)
+        result.metadata["snapshot_path"] = snap_path.relative_to(execution.root).as_posix()
+    progress("REPORT_GENERATION", 6)
     report_started = time.perf_counter()
     paths = write_reports(result, output_dir)
-    logger.step("generate_report", "ReportGenerator", "success", ", ".join(paths.values()), duration=time.perf_counter()-report_started)
-    result.metadata["report_paths"] = paths
+    published_paths = ({key: Path(value).relative_to(execution.root).as_posix() for key, value in paths.items()}
+                       if execution else paths)
+    logger.step("generate_report", "ReportGenerator", "success", ", ".join(published_paths.values()), duration=time.perf_counter()-report_started)
+    result.metadata["report_paths"] = published_paths
     # Persist final metadata/result with report paths.
     Path(paths["json"]).write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    progress("ARTIFACT_VERIFICATION", 7)
     return result

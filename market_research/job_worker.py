@@ -9,6 +9,7 @@ from typing import Protocol
 
 from .job_store import (InvalidTransition, Job, JobState, JobStore, JobStoreError,
                         SmokeRequest, StoreBusy, UnsafeArtifact)
+from .research_contract import PreparedResearchResult, ResearchFailed, ResearchRequest
 
 
 class JobCancelled(Exception):
@@ -46,7 +47,7 @@ class JobContext:
 
 
 class JobHandler(Protocol):
-    def __call__(self, request: SmokeRequest, context: JobContext) -> str:
+    def __call__(self, request: SmokeRequest | ResearchRequest, context: JobContext) -> str | PreparedResearchResult:
         """Return an existing artifact path relative to context.output_dir, or raise."""
         ...
 
@@ -68,12 +69,17 @@ def smoke_handler(request: SmokeRequest, context: JobContext) -> str:
     return "smoke.json"
 
 
+def _research_handler(request: ResearchRequest, context: JobContext) -> PreparedResearchResult:
+    from .research_job import research_handler
+    return research_handler(request, context)
+
+
 class Worker:
     """One sequential executor; a dedicated heartbeat protects long handler phases."""
     def __init__(self, store: JobStore, *, handlers: dict[str, JobHandler] | None = None,
                  shutdown: threading.Event | None = None):
         self.store = store
-        self.handlers = {"smoke": smoke_handler} if handlers is None else dict(handlers)
+        self.handlers = {"smoke": smoke_handler, "research": _research_handler} if handlers is None else dict(handlers)
         self.shutdown = shutdown if shutdown is not None else threading.Event()
         self.worker_id = None
         self._lease_lost = threading.Event()
@@ -137,7 +143,13 @@ class Worker:
                     raise NotImplementedError("No registered handler")
                 result_path = handler(job.request, context)
                 context.checkpoint()
+                if isinstance(result_path, PreparedResearchResult):
+                    return self.store.finish(job.job_id, self.worker_id, JobState.COMPLETED,
+                                             result_path=result_path.result_path, research_outcome=result_path.outcome)
                 return self.store.finish(job.job_id, self.worker_id, JobState.COMPLETED, result_path=result_path)
+            except ResearchFailed as exc:
+                return self.store.finish(job.job_id, self.worker_id, JobState.FAILED,
+                                         error_code=exc.code, research_outcome=exc.outcome)
             except JobCancelled:
                 return self.store.finish(job.job_id, self.worker_id, JobState.CANCELLED)
             except WorkerInterrupted:

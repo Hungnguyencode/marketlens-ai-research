@@ -67,7 +67,7 @@ def test_input_validation_does_not_store_or_echo_disallowed_payload(store, paylo
     assert store.list_jobs() == []
 
 
-def test_unimplemented_research_is_rejected_and_missing_handler_fails(store):
+def test_incomplete_research_request_is_rejected_and_missing_smoke_handler_fails(store):
     with pytest.raises(ValueError, match="unavailable"):
         store.submit("research", {})
     job = store.submit("smoke")

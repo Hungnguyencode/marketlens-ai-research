@@ -212,7 +212,7 @@ Output mới ở `outputs/comparisons/comparison-<timestamp>-<unique-id>/` gồm
 
 ## Persistent local jobs — Milestone 3.1
 
-M3.1 chỉ bổ sung hạ tầng job SQLite và worker Python độc lập. Chưa có nút chạy research trong Streamlit và chưa nối job với collector, Ollama, comparison hoặc validator. Loại job duy nhất là `smoke`: kiểm tra hạ tầng offline, tạo `TEST_SMOKE` JSON với `market_validation=NOT_APPLICABLE`, không phải evidence hay research report. Job type chưa triển khai bị từ chối; payload không cho phép command, module, credential, đường dẫn hoặc text tùy ý. Không có thread, worker hay database được khởi tạo chỉ vì import module.
+M3.1 bổ sung hạ tầng job SQLite và worker Python độc lập; M3.2 mở rộng bằng job `research` trong phần bên dưới. `smoke` vẫn kiểm tra hạ tầng offline, tạo `TEST_SMOKE` JSON với `market_validation=NOT_APPLICABLE`, không phải evidence hay research report. Job type ngoài allowlist bị từ chối; payload smoke không cho phép command, module, credential, đường dẫn hoặc text tùy ý. Không có thread, worker hay database được khởi tạo chỉ vì import module.
 
 Database mặc định: `outputs/jobs/jobs.sqlite3`; artifact: `outputs/jobs/artifacts/<job-id>/smoke.json`. Cả hai nằm trong `outputs/` đã bị Git ignore, tách khỏi batch/comparison/golden cũ. Mỗi job có UUID 32 ký tự hex và thư mục mới, không dùng lại thư mục có sẵn. Có thể đổi `--db` và `--artifact-dir` trước subcommand; nếu không chỉ định artifact root thì dùng `<thư-mục-db>/artifacts`. Chỉ dùng SQLite trên ổ đĩa cục bộ. Artifact root được lưu cùng DB; mở cùng DB với root khác sẽ bị từ chối. Khi chọn vị trí tùy chỉnh, giữ runtime data ngoài Git.
 
@@ -271,13 +271,82 @@ Nếu worker bị kill/mất điện, job có thể còn `RUNNING` đến khi le
 
 Lease hết hạn là tín hiệu mất quyền sở hữu, không chứng minh process đã chết: máy bị pause, đồng hồ đổi hoặc SQLite bị khóa lâu cũng có thể làm lease hết. Owner cũ không được gia hạn lease đã hết hoặc ghi trạng thái hoàn tất sau khi bị fence; handler cũ vẫn có thể còn thao tác cho tới checkpoint. Trước khi tự tạo job mới, người dùng phải xác nhận process cũ đã dừng và xem output một phần. M3.1 không hỗ trợ retry tự động hay requeue, kể cả đối với smoke.
 
-**Hợp đồng M3.2:** đăng ký rõ job type/request model mới trong allowlist/schema và một callable `handler(validated_request, context) -> relative_artifact_path`; không import module hoặc chạy shell theo payload. Adapter tái sử dụng `run_research`, `EvidenceStore`, `ExecutionLogger`, models, report writer và validator hiện có. Handler dùng `context.output_dir`, kiểm tra `context.checkpoint()` giữa các thao tác tốn tài nguyên, báo tiến độ thật bằng `context.progress(...)`, chỉ return sau khi các bước pipeline cần thiết và artifact checks hoàn tất, raise nếu thất bại. Không biến state job thành kết luận validation của research. `run_research` hiện còn ghi `snapshots/` và `logs/` theo working directory; M3.2 phải bổ sung path injection theo job cho các output này trước khi nối handler thật. Danh sách phase/typed request và schema version cần được mở rộng có kiểm soát; M3.1 không thay đổi engine hay semantic validator.
+M3.2 đã triển khai adapter cho research theo hợp đồng dưới đây. Smoke handler và các lệnh M3.1 giữ nguyên; job type/request được đăng ký tường minh, không import module hoặc chạy shell theo payload. CLI dùng JSON với Unicode escapes để giữ nguyên topic/filename khi PowerShell pipe dùng encoding cũ; các artifact text vẫn ghi UTF-8.
 
 Kiểm thử job runner hoàn toàn offline, tạo DB/artifacts trong temp riêng:
 
 ```powershell
 & $python -m pytest tests/test_jobs.py -q
 ```
+
+## Research jobs — Milestone 3.2 (backend)
+
+`research_job.research_handler` gọi đúng production entry point `orchestrator.run_research`, dùng lại `EvidenceStore`, `ExecutionLogger`, fact builders, `OllamaClient`, validator và JSON/Markdown/HTML report writer. Không có research engine thứ hai. Execution context tùy chọn bổ sung đường dẫn theo job, quyền gọi dịch vụ và callbacks. Legacy `main.py` không truyền context nên giữ nguyên đường dẫn snapshot/log/report và hành vi cũ. Chưa có job controls trong dashboard; comparison/batch và Open Library standalone không thay đổi. `live` của pipeline đơn này dùng Google Books hiện có, không tự chuyển sang Open Library.
+
+**Request bất biến:** một topic, mode `csv_import`/`replay`/`live`, input path + SHA-256 đối với mode local, URL export thật đối với CSV, `allow_network`, `allow_inference`, model và timeout. Mặc định model `qwen3:4b-instruct`, region Hoa Kỳ, timeout nguồn 15 giây và inference 120 giây. Mode local không cho bật network; live bắt buộc `--allow-network` và không nhận local input. Inference chỉ được gọi khi có `--allow-inference`; biến `OLLAMA_MODEL` không thay model đã lưu trong request. Nếu được phép inference, worker dùng `OLLAMA_BASE_URL` hoặc `http://localhost:11434`, chỉ nhận endpoint HTTP loopback không chứa credential. Không đổi host binding hoặc tải model. Quyền inference bao gồm planning của live mode và bounded JSON/claim repair vốn có trong engine; runner không retry hoặc requeue job.
+
+Input phải là CSV/JSON local có sẵn, tối đa 32 MiB, nằm trong input root cho phép. Mặc định root là repository; có thể đặt `--input-root` khi tạo DB riêng để dùng file thật ở vị trí khác. Root được persist trong DB nên worker process mới không cần khai báo lại. Reject traversal, UNC, symlink/junction, alternate data stream và đường dẫn mơ hồ. CSV phải có đúng một keyword series cho một niche Hoa Kỳ, kèm URL Google Trends thực có `geo=US` và một giá trị `q` khớp keyword trong header; chưa hỗ trợ joint export hoặc topic-ID URL trong job đơn này. Replay giữ nguyên evidence IDs, retrieval timestamps và nguồn cũ. SHA-256 được chốt khi submit, đối chiếu lại trước khi copy input vào job; file bị sửa/xóa trong queue làm job `FAILED` trước khi gọi dịch vụ. Không đưa key hoặc credential vào topic, source URL hoặc file input. API key chỉ lấy từ environment của worker, không lưu trong request/SQLite/log.
+
+**Schema v2:** thêm loại `research`, provenance `RESEARCH_PIPELINE`, input root và `outcome_json` chứa bản tóm tắt từ `ResearchResult` chuẩn. Khi mở DB M3.1, migration transaction giữ nguyên smoke jobs, states và references. Phải dừng worker M3.1 và chờ lease hết trước khi nâng cấp; migration từ chối nếu còn lease cũ hoạt động. Không có downgrade tự động; không mở lại DB v2 bằng code M3.1.
+
+**State và validation:** `COMPLETED` chỉ xác nhận workflow và bundle hoàn tất. `research_outcome.validation_status/valid/schema_valid/claims_valid/evidence_sufficient` lấy từ validator hiện có, không suy ra từ state job. Workflow offline không được phép inference dùng deterministic fallback; với evidence, validator thường trả `DEGRADED`, không gắn `VALID`. Model trả lời thành công nhưng claim sai có thể tạo job `COMPLETED` với outcome `INVALID` và report cách ly nội dung chưa đạt. Source operation lỗi hoặc analysis timeout/failure tạo job `FAILED`, có safe error code và outcome chẩn đoán nếu pipeline đã tạo được; reports chẩn đoán giữ ở `_partial`, không có result reference. Canonical facts, uncertainty và ID tham chiếu giữ nguyên. Analysis `VALID` không xác minh sales hoặc cơ hội thương mại; catalog và Trends vẫn có các giới hạn đã nêu ở trên.
+
+**Output và publication:** mỗi job ghi input snapshot, evidence snapshot, log và ba reports vào `outputs/jobs/artifacts/<job-id>/_partial/`. Các reference bên trong là đường dẫn tương đối theo bundle. Sau khi kiểm tra manifest/checksums, worker giữ transaction và quyền sở hữu, đối chiếu cancellation rồi rename nguyên thư mục thành `result/` và ghi reference `<job-id>/result/manifest.json` cùng outcome. Không ghi đè thư mục có sẵn. Manifest liên kết job/request/hash input, research run, validation, model provenance và hash từng artifact. SQLite và filesystem không có transaction chung: nếu commit DB thất bại sau rename, folder có thể còn nhưng không có reference `COMPLETED`; đó là output chưa công bố để xem xét, không tự retry. M3.3 chỉ được hiển thị kết quả qua job `COMPLETED` có reference hợp lệ, không quét folder để tự công nhận kết quả.
+
+Progress ghi các boundary thật: input validation, planning, collection/import, evidence preparation, model hoặc deterministic analysis, claim validation, reports, artifact verification và ready-to-publish. `PUBLICATION` chỉ ghi khi terminal transaction công bố bundle thành công. Không có phần trăm ước lượng. Heartbeat chạy trên thread riêng trong lúc HTTP/model blocking. Checkpoint trước/sau từng HTTP request ngăn retry/repair kế tiếp khi đã hủy. Request HTTP đang chạy không bị ngắt ngay; cancellation giữ `RUNNING` cho tới request trả về hoặc timeout. Sau cancellation/interruption, reference vẫn rỗng và không rename `_partial`. Policy lease/recovery M3.1 giữ nguyên: mất quyền sở hữu → `INTERRUPTED`, cần xem xét thủ công, không tự replay.
+
+### Xác minh offline (không gọi mạng hoặc model)
+
+Test sử dụng input **SYNTHETIC**, fake services/MockTransport và DB tạm; kiểm tra worker process mới có chặn network:
+
+```powershell
+$py = Join-Path $PWD '.venv\Scripts\python.exe'
+& $py -m pytest tests/test_jobs.py tests/test_research_jobs.py -q
+& $py -m pytest -q
+```
+
+Để chạy pipeline offline với CSV thật đã có sẵn, tự chọn đúng file export **một keyword** ở United States và URL nguồn của chính export đó. Không cần Ollama cho lệnh này. Lệnh tạo DB xác minh mới để không đổi input root của DB đang dùng:
+
+```powershell
+$csv = Get-Item -LiteralPath (Read-Host 'Đường dẫn CSV Google Trends thật đã có trên máy')
+if ($csv.PSIsContainer -or $csv.Extension -ne '.csv') { throw 'Hãy chọn một file CSV thật.' }
+$topic = Read-Host 'Một niche/chủ đề được phép nghiên cứu'
+$sourceUrl = Read-Host 'URL Google Trends thực của export này (geo=US)'
+$db = Join-Path $PWD ('outputs\jobs\m32-' + [guid]::NewGuid().ToString('N') + '.sqlite3')
+$submitted = & $py -m market_research.jobs --db $db --input-root $csv.DirectoryName submit-research --topic $topic --mode csv_import --input $csv.FullName --source-url $sourceUrl
+if ($LASTEXITCODE -ne 0) { throw 'Submit thất bại; đọc diagnostic JSON trước khi thử lại.' }
+$job = $submitted | ConvertFrom-Json
+& $py -m market_research.jobs --db $db worker --once
+& $py -m market_research.jobs --db $db inspect $job.job_id
+```
+
+Kiểm tra state cùng `research_outcome`, không chỉ exit code. Với no-inference và có evidence, kết quả thông thường là `COMPLETED` + `DEGRADED` + `model_execution_status=not_requested`, không phải nghiên cứu AI đã kiểm định. Đọc manifest từ `result_path` dưới artifact root của DB. Có thể dùng mode `replay` với một evidence JSON thật do người dùng chọn, bỏ `--source-url`; job không đọc lại analysis cũ như một kết quả model mới.
+
+### Tùy chọn: người dùng chủ động cho phép inference thật
+
+Chỉ chạy nếu muốn gọi Ollama local. Dùng lại các biến `$csv`, `$topic`, `$sourceUrl`, `$db` từ quy trình trên:
+
+```powershell
+$aiJob = & $py -m market_research.jobs --db $db submit-research --topic $topic --mode csv_import --input $csv.FullName --source-url $sourceUrl --allow-inference --model 'qwen3:4b-instruct' | ConvertFrom-Json
+& $py -m market_research.jobs --db $db worker --once
+& $py -m market_research.jobs --db $db inspect $aiJob.job_id
+```
+
+Chỉ sau khi người dùng kiểm tra outcome, references và report mới xác nhận live inference end-to-end. Tests offline với model fake không chứng minh Ollama thực đã nhận evidence.
+
+### Tùy chọn: người dùng chủ động cho phép collection mạng
+
+Lệnh sau chỉ cho phép Google Books collection; không bật Ollama. Google Books có thể tiếp tục trả 429; job sẽ báo lỗi/diagnostic đúng và không thay bằng dữ liệu giả:
+
+```powershell
+$catalogJob = & $py -m market_research.jobs --db $db submit-research --topic $topic --mode live --allow-network | ConvertFrom-Json
+& $py -m market_research.jobs --db $db worker --once
+& $py -m market_research.jobs --db $db inspect $catalogJob.job_id
+```
+
+Chỉ thêm `--allow-inference` khi đồng thời muốn cho phép model. Worker liên tục, list, inspect, cancel và recover dùng như M3.1, thêm cùng `--db $db`. Không cần giữ Streamlit mở.
+
+**Hợp đồng M3.3:** UI gọi `JobStore.submit('research', validated_payload)` với từng quyền được người dùng chọn rõ, poll `get/list_jobs`, đọc state và outcome riêng, kiểm tra manifest trước khi trình bày report và dùng `request_cancel` cho hủy. UI không thực thi handler, không tự tạo worker lúc import/rerun và không dùng `COMPLETED` thay cho validator `VALID`. Worker CLI tiếp tục là process độc lập. M3.2 chưa thêm dashboard controls, chưa xác minh live collection/inference trong lượt triển khai này.
 
 ## Dashboard Streamlit — Milestone 2.5
 

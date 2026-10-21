@@ -12,6 +12,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .research_contract import (RESEARCH_PHASES, RESEARCH_STEPS, WORKSPACE, ResearchOutcome,
+                                ResearchRequest, prepare_request, verify_bundle)
+
 
 DEFAULT_DATABASE = Path(__file__).resolve().parents[1] / "outputs/jobs/jobs.sqlite3"
 
@@ -34,8 +37,8 @@ class SmokeRequest(BaseModel):
 class Job(BaseModel):
     model_config = ConfigDict(frozen=True)
     job_id: str
-    job_type: Literal["smoke"]
-    request: SmokeRequest
+    job_type: Literal["smoke", "research"]
+    request: SmokeRequest | ResearchRequest
     state: JobState
     created_at: datetime
     started_at: datetime | None
@@ -48,8 +51,9 @@ class Job(BaseModel):
     error_message: str | None
     result_path: str | None
     attempt_count: int
-    execution_provenance: Literal["NOT_RUN", "TEST_SMOKE"]
+    execution_provenance: Literal["NOT_RUN", "TEST_SMOKE", "RESEARCH_PIPELINE"]
     worker_id: str | None
+    research_outcome: ResearchOutcome | None = None
 
 
 class JobStoreError(RuntimeError):
@@ -68,6 +72,10 @@ class UnsafeArtifact(JobStoreError):
     pass
 
 
+class ResearchInputError(ValueError):
+    """Only fixed schema/path diagnostics, safe to display through the CLI."""
+
+
 def validate_id(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
         raise ValueError("ID must be 32 lowercase hexadecimal characters.")
@@ -79,11 +87,16 @@ ERRORS = {
     "INVALID_RESULT": "Handler did not return an existing, nonempty artifact inside its job directory.",
     "WORKER_STOPPED": "Worker stopped before completion; review partial outputs before any new submission.",
     "LEASE_EXPIRED": "Worker lease expired; execution is interrupted and requires review. No automatic replay.",
+    "RESEARCH_INPUT_FAILED": "Research input is missing, unsafe or changed since submission; no external work was authorized for changed data.",
+    "RESEARCH_COLLECTION_FAILED": "Requested source operation failed. Unpublished diagnostic artifacts may be available.",
+    "RESEARCH_INFERENCE_FAILED": "Authorized Ollama analysis failed or timed out. Diagnostics remain unpublished.",
+    "RESEARCH_CONFIGURATION_FAILED": "Ollama must use a credential-free local loopback HTTP endpoint.",
 }
 
 
 class JobStore:
     def __init__(self, database: str | Path = DEFAULT_DATABASE, *, artifact_root: str | Path | None = None,
+                 input_root: str | Path | None = None,
                  busy_timeout: float = 2.0, lease_seconds: float = 30.0, clock=None):
         if not 0 < busy_timeout <= 10 or not 3 <= lease_seconds <= 300:
             raise ValueError("busy_timeout must be (0,10] seconds; lease_seconds must be [3,300].")
@@ -95,14 +108,34 @@ class JobStore:
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS workers (
-                    worker_id TEXT PRIMARY KEY, heartbeat_at TEXT NOT NULL,
-                    lease_expires_at TEXT NOT NULL, stopped_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id TEXT PRIMARY KEY, job_type TEXT NOT NULL CHECK(job_type='smoke'),
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("""CREATE TABLE IF NOT EXISTS workers (
+                worker_id TEXT PRIMARY KEY, heartbeat_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL, stopped_at TEXT)""")
+            settings = dict(db.execute("SELECT key,value FROM settings"))
+            version = settings.get("schema_version")
+            if version not in (None, "1", "2"):
+                raise JobStoreError("Unsupported job database schema version.")
+            if settings.get("artifact_root", str(self.artifact_root)) != str(self.artifact_root):
+                raise JobStoreError("Database artifact directory differs from the persisted configuration.")
+            configured_input = input_root or settings.get("input_root", WORKSPACE)
+            if str(configured_input).startswith(("\\\\", "//")):
+                raise JobStoreError("Input root must be a local directory, not a network share.")
+            self.input_root = Path(configured_input).resolve(strict=True)
+            if not self.input_root.is_dir() or settings.get("input_root", str(self.input_root)) != str(self.input_root):
+                raise JobStoreError("Database input directory differs from the persisted configuration.")
+            if version == "1":
+                if db.execute("SELECT 1 FROM workers WHERE stopped_at IS NULL AND lease_expires_at>? LIMIT 1",
+                              (self._stamp(self._now()),)).fetchone():
+                    raise JobStoreError("Stop M3.1 workers and wait for their leases before upgrading this database.")
+                for name in ("immutable_job_request", "allowed_job_transition"):
+                    db.execute(f"DROP TRIGGER IF EXISTS {name}")
+                for name in ("jobs_queue", "worker_running_job"):
+                    db.execute(f"DROP INDEX IF EXISTS {name}")
+                db.execute("ALTER TABLE jobs RENAME TO jobs_v1")
+            db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY, job_type TEXT NOT NULL CHECK(job_type IN ('smoke','research')),
                     request_json TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN ('QUEUED','RUNNING','COMPLETED','FAILED','CANCELLED','INTERRUPTED')),
                     created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
@@ -112,25 +145,25 @@ class JobStore:
                     error_code TEXT, error_message TEXT, result_path TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     execution_provenance TEXT NOT NULL DEFAULT 'NOT_RUN',
-                    worker_id TEXT REFERENCES workers(worker_id),
+                    worker_id TEXT REFERENCES workers(worker_id), outcome_json TEXT,
                     CHECK(state!='COMPLETED' OR result_path IS NOT NULL)
-                );
-                CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, created_at, job_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS worker_running_job ON jobs(worker_id) WHERE state='RUNNING';
-                CREATE TRIGGER IF NOT EXISTS immutable_job_request
+                )""")
+            if version == "1":
+                db.execute("INSERT INTO jobs SELECT *,NULL FROM jobs_v1")
+                db.execute("DROP TABLE jobs_v1")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, created_at, job_id)")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS worker_running_job ON jobs(worker_id) WHERE state='RUNNING'")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS immutable_job_request
                     BEFORE UPDATE OF job_id,job_type,request_json,created_at ON jobs
-                    BEGIN SELECT RAISE(ABORT, 'immutable job request'); END;
-                CREATE TRIGGER IF NOT EXISTS allowed_job_transition BEFORE UPDATE OF state ON jobs
+                    BEGIN SELECT RAISE(ABORT, 'immutable job request'); END""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS allowed_job_transition BEFORE UPDATE OF state ON jobs
                     WHEN OLD.state != NEW.state AND NOT (
                         (OLD.state='QUEUED' AND NEW.state IN ('RUNNING','CANCELLED')) OR
                         (OLD.state='RUNNING' AND NEW.state IN ('COMPLETED','FAILED','CANCELLED','INTERRUPTED')))
-                    BEGIN SELECT RAISE(ABORT, 'invalid job state transition'); END;
-            """)
-            db.execute("BEGIN IMMEDIATE")
-            for key, value in (("schema_version", "1"), ("artifact_root", str(self.artifact_root))):
-                db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, value))
-                if db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()[0] != value:
-                    raise JobStoreError("Database schema or artifact directory differs from the persisted configuration.")
+                    BEGIN SELECT RAISE(ABORT, 'invalid job state transition'); END""")
+            for key, value in (("schema_version", "2"), ("artifact_root", str(self.artifact_root)),
+                               ("input_root", str(self.input_root))):
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
 
     def _now(self):
         value = self.clock()
@@ -178,21 +211,34 @@ class JobStore:
     @staticmethod
     def _job(row):
         fields = dict(row)
-        fields["request"] = SmokeRequest.model_validate_json(fields.pop("request_json"))
+        request_type = ResearchRequest if fields["job_type"] == "research" else SmokeRequest
+        fields["request"] = request_type.model_validate_json(fields.pop("request_json"))
+        raw_outcome = fields.pop("outcome_json")
+        fields["research_outcome"] = ResearchOutcome.model_validate_json(raw_outcome) if raw_outcome else None
         return Job.model_validate(fields)
 
     def submit(self, job_type: str, payload: dict | None = None, *, job_id: str | None = None) -> Job:
-        if job_type != "smoke":
-            raise ValueError("Only the offline smoke job is implemented; research jobs are unavailable in M3.1.")
+        if job_type not in {"smoke", "research"}:
+            raise ValueError("Only explicitly registered smoke and research job types are available.")
         try:
-            request = SmokeRequest.model_validate({} if payload is None else payload)
-        except ValidationError:
+            request = (prepare_request(payload or {}, self.input_root) if job_type == "research"
+                       else SmokeRequest.model_validate({} if payload is None else payload))
+        except (ValidationError, ValueError, OSError) as exc:
+            if job_type == "research":
+                if isinstance(exc, ValidationError):
+                    message = "; ".join(error["msg"] for error in exc.errors(include_input=False))
+                elif isinstance(exc, OSError):
+                    message = "Input file missing or unreadable within the configured input root."
+                else:
+                    message = str(exc)
+                raise ResearchInputError("Research request unavailable: " + message) from None
             raise ValueError("Invalid smoke request: only integer steps between 1 and 5 are accepted.") from None
         job_id = validate_id(uuid4().hex if job_id is None else job_id)
         with self._connection(write=True) as db:
             db.execute("""INSERT INTO jobs (job_id,job_type,request_json,state,created_at,phase,
                 completed_steps,total_steps) VALUES (?,?,?,'QUEUED',?,'QUEUED',0,?)""",
-                (job_id, job_type, request.model_dump_json(), self._stamp(self._now()), request.steps))
+                (job_id, job_type, request.model_dump_json(), self._stamp(self._now()),
+                 RESEARCH_STEPS if job_type == "research" else request.steps))
         return self.get(job_id)
 
     def get(self, job_id: str) -> Job:
@@ -249,7 +295,8 @@ class JobStore:
                 return None
             job_id = row[0]
             db.execute("""UPDATE jobs SET state='RUNNING',started_at=?,phase='STARTING',worker_id=?,
-                attempt_count=attempt_count+1,execution_provenance='TEST_SMOKE' WHERE job_id=? AND state='QUEUED'""",
+                attempt_count=attempt_count+1,execution_provenance=CASE WHEN job_type='research'
+                    THEN 'RESEARCH_PIPELINE' ELSE 'TEST_SMOKE' END WHERE job_id=? AND state='QUEUED'""",
                 (now, worker_id, job_id))
         return self.get(job_id)
 
@@ -273,7 +320,7 @@ class JobStore:
             return self._job(self._owned(db, job_id, worker_id))
 
     def report_progress(self, job_id: str, worker_id: str, phase: str, completed_steps: int) -> None:
-        if phase not in {"STARTING", "SMOKE", "FINALIZING"} or type(completed_steps) is not int:
+        if phase not in {"STARTING", "SMOKE", "FINALIZING"} | RESEARCH_PHASES or type(completed_steps) is not int:
             raise ValueError("Progress requires an allowed phase and an integer completed step count.")
         with self._connection(write=True) as db:
             row = self._owned(db, job_id, worker_id)
@@ -299,10 +346,13 @@ class JobStore:
             raise UnsafeArtifact(ERRORS["INVALID_RESULT"])
         return path.relative_to(self.artifact_root).as_posix()
 
-    def finish(self, job_id: str, worker_id: str, state: JobState, *, result_path=None, error_code=None) -> Job:
+    def finish(self, job_id: str, worker_id: str, state: JobState, *, result_path=None, error_code=None,
+               research_outcome: ResearchOutcome | None = None) -> Job:
         if state not in {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED, JobState.INTERRUPTED}:
             raise InvalidTransition("Worker can only finish a RUNNING job in a terminal state.")
-        if state == JobState.FAILED and error_code not in {"HANDLER_FAILED", "INVALID_RESULT"}:
+        if state == JobState.FAILED and error_code not in {"HANDLER_FAILED", "INVALID_RESULT",
+                "RESEARCH_INPUT_FAILED", "RESEARCH_COLLECTION_FAILED", "RESEARCH_INFERENCE_FAILED",
+                "RESEARCH_CONFIGURATION_FAILED"}:
             raise ValueError("Failure requires a known safe error code.")
         if state == JobState.INTERRUPTED:
             error_code = "WORKER_STOPPED"
@@ -318,11 +368,30 @@ class JobStore:
                     raise UnsafeArtifact(ERRORS["INVALID_RESULT"])
                 else:
                     reference = self._result_reference(job_id, result_path)
+                    if row["job_type"] == "research":
+                        try:
+                            if result_path != "_partial/manifest.json" or research_outcome is None:
+                                raise ValueError("Missing prepared research outcome")
+                            directory = self.output_directory(job_id)
+                            request = ResearchRequest.model_validate_json(row["request_json"])
+                            verify_bundle(directory, job_id, request, research_outcome)
+                            if (directory / "result").exists():
+                                raise ValueError("Publication target already exists")
+                            (directory / "_partial").rename(directory / "result")
+                            reference = self._result_reference(job_id, "result/manifest.json")
+                        except (OSError, ValueError, KeyError, TypeError):
+                            raise UnsafeArtifact(ERRORS["INVALID_RESULT"]) from None
             if state == JobState.CANCELLED and not row["cancellation_requested_at"]:
                 raise InvalidTransition("Cancellation requires a persisted cancellation request.")
-            db.execute("""UPDATE jobs SET state=?,finished_at=?,result_path=?,error_code=?,error_message=?
+            if state in {JobState.CANCELLED, JobState.INTERRUPTED}:
+                research_outcome = None
+            if row["job_type"] == "smoke" and research_outcome is not None:
+                raise ValueError("Smoke jobs cannot declare research outcomes.")
+            phase = "PUBLICATION" if state == JobState.COMPLETED and row["job_type"] == "research" else row["phase"]
+            db.execute("""UPDATE jobs SET state=?,finished_at=?,result_path=?,error_code=?,error_message=?,outcome_json=?,phase=?
                 WHERE job_id=?""", (state, self._stamp(self._now()), reference, error_code,
-                                     ERRORS.get(error_code), job_id))
+                                     ERRORS.get(error_code), research_outcome.model_dump_json() if research_outcome else None,
+                                     phase, job_id))
         return self.get(job_id)
 
     def recover_stale(self) -> int:

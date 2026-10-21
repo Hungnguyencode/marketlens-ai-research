@@ -37,12 +37,14 @@ class GoogleBooksCollector:
 
     def __init__(self, timeout: float = 15, api_key: str | None = None, client=None,
                  max_retries: int = 2, base_backoff_seconds: float = 0.6,
-                 max_backoff_seconds: float = 8.0, sleep_fn=time.sleep, random_fn=random.random):
+                 max_backoff_seconds: float = 8.0, sleep_fn=time.sleep, random_fn=random.random,
+                 checkpoint=None):
         self.timeout, self.api_key, self.client = timeout, api_key, client
         self.max_retries = max(0, min(int(max_retries), 2))
         self.base_backoff_seconds = max(0.0, base_backoff_seconds)
         self.max_backoff_seconds = max(0.0, max_backoff_seconds)
         self.sleep_fn, self.random_fn = sleep_fn, random_fn
+        self.checkpoint = checkpoint or (lambda: None)
 
     @staticmethod
     def _error_fields(response: httpx.Response) -> tuple[str, str]:
@@ -90,6 +92,7 @@ class GoogleBooksCollector:
 
     def _request_with_client(self, client, params: dict) -> dict:
         for attempt in range(1, self.max_retries + 2):
+            self.checkpoint()
             try:
                 response = client.get(self.endpoint, params=params, timeout=self.timeout)
             except httpx.TimeoutException as exc:
@@ -98,6 +101,8 @@ class GoogleBooksCollector:
                 # Do not forward exception text: it can contain the full URL including API key.
                 raise GoogleBooksCollectionError(f"Google Books network request failed ({type(exc).__name__})",
                     reason="network_error", attempts=attempt) from exc
+            finally:
+                self.checkpoint()
 
             if response.status_code == 429:
                 reason, message = self._error_fields(response)
@@ -114,6 +119,7 @@ class GoogleBooksCollector:
                         f"Google Books requested a {delay:.1f}s retry delay, beyond the configured {self.max_backoff_seconds:.1f}s wait cap; stopped without retry",
                         status_code=429, reason=reason, attempts=attempt, retry_after_seconds=delay)
                 self.sleep_fn(delay)
+                self.checkpoint()
                 continue
 
             if response.status_code >= 400:
