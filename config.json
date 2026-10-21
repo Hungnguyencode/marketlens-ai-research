@@ -1,0 +1,14 @@
+{
+  "category": "Coloring & Activity Books",
+  "target_region": "United States",
+  "keyword_language": "English",
+  "report_language": "Vietnamese",
+  "time_range": "past 12 months",
+  "model": "qwen3:4b-instruct",
+  "default_niches": [
+    "cozy coloring books for adults",
+    "bold and easy coloring books",
+    "Christmas coloring books for adults",
+    "kids Christmas activity books"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "csv_path": "data/REPLACE_WITH_REAL_JOINT_TRENDS_EXPORT.csv",
+  "batch_directory": "outputs/batches/REPLACE_WITH_YOUR_BATCH_ID",
+  "source_url": null,
+  "settings_origin": "user_declared",
+  "region": "US",
+  "category": "All categories",
+  "search_type": "Web Search",
+  "period_start": "2025-10-19",
+  "period_end": "2026-10-18",
+  "as_of": "2026-10-20",
+  "keyword_by_niche": {
+    "cozy-adults": "cozy coloring book",
+    "bold-easy": "bold and easy coloring book",
+    "christmas-adults": "christmas coloring book for adults",
+    "kids-christmas": "kids christmas activity book"
+  },
+  "sparse_positive_fraction_threshold": 0.2,
+  "minimum_positive_weeks_per_window": 2
+}
