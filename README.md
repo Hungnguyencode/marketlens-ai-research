@@ -346,7 +346,110 @@ $catalogJob = & $py -m market_research.jobs --db $db submit-research --topic $to
 
 Chỉ thêm `--allow-inference` khi đồng thời muốn cho phép model. Worker liên tục, list, inspect, cancel và recover dùng như M3.1, thêm cùng `--db $db`. Không cần giữ Streamlit mở.
 
-**Hợp đồng M3.3:** UI gọi `JobStore.submit('research', validated_payload)` với từng quyền được người dùng chọn rõ, poll `get/list_jobs`, đọc state và outcome riêng, kiểm tra manifest trước khi trình bày report và dùng `request_cancel` cho hủy. UI không thực thi handler, không tự tạo worker lúc import/rerun và không dùng `COMPLETED` thay cho validator `VALID`. Worker CLI tiếp tục là process độc lập. M3.2 chưa thêm dashboard controls, chưa xác minh live collection/inference trong lượt triển khai này.
+**Workspace M3.3:** trang **Không gian nghiên cứu** bổ sung ba tab Tạo nghiên cứu, Theo dõi job và Lịch sử & kết quả; dùng JobStore, typed request và worker M3.2 hiện có. Năm trang batch cũ vẫn đọc artifacts riêng. Workspace mở được ngay cả khi chưa có batch hoặc dữ liệu lịch sử.
+
+### Khởi chạy workspace — hai terminal Windows
+
+Không cần cấu hình mới nếu dùng DB mặc định: chạy hai lệnh bên dưới từ cùng thư mục repository, bỏ các biến `MARKETLENS_*`. Cả dashboard và CLI mặc định dùng `outputs/jobs/jobs.sqlite3`, artifacts ở `outputs/jobs/artifacts`, input root đọc từ settings của DB (DB mới mặc định repository). Không tự nhận các DB M3.2 khác nằm cạnh đó.
+
+Để dùng workspace mới, riêng biệt và portable, chạy **cùng khối cấu hình này trong CẢ HAI terminal**. Đường dẫn tương đối được đổi thành tuyệt đối theo thư mục repository lúc thiết lập, không ghi vào source/config Git:
+
+```powershell
+Set-Location (Join-Path $HOME 'ai-market-research-agent')
+$env:MARKETLENS_JOBS_DB = Join-Path $PWD 'outputs\workspace\jobs.sqlite3'
+$env:MARKETLENS_INPUT_ROOT = Join-Path $PWD 'outputs\workspace\inputs'
+$env:MARKETLENS_JOB_ARTIFACT_ROOT = Join-Path $PWD 'outputs\workspace\artifacts'
+```
+
+Terminal A:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run .\dashboard.py --server.address 127.0.0.1
+```
+
+Terminal B (giữ chạy; `Ctrl+C` để dừng hợp tác):
+
+```powershell
+.\.venv\Scripts\python.exe -m market_research.jobs worker
+```
+
+Cấu hình environment được dùng chung qua `job_config.open_job_store`; các cờ CLI `--db`, `--input-root`, `--artifact-dir` có ưu tiên cao hơn environment. `.env.example` chỉ là mẫu, **không tự nạp** vào PowerShell/Streamlit. Input root và artifact root được chốt theo DB; cấu hình khác với settings đã lưu sẽ báo lỗi, không tự đổi root. Khi chọn DB M3.2 cũ, đặt `MARKETLENS_JOBS_DB` đúng DB đó, artifact root đúng cấu hình đã dùng và bỏ `MARKETLENS_INPUT_ROOT` để tái dùng root đã lưu. Phải dùng cùng cấu hình cho cả hai process; environment ở terminal A không tự truyền sang terminal B. Chỉ host loopback; ứng dụng local chưa có authentication/multi-user access control.
+
+### Upload, quyền chạy và provenance
+
+1. Mở `http://127.0.0.1:8501/?workspace=research` hoặc chọn **Không gian nghiên cứu**.
+2. Nhập một chủ đề, tải CSV Google Trends **thật** với một keyword tại United States; cung cấp URL HTTPS Google Trends đã dùng để export (`geo=US`, `q` khớp keyword). Hỗ trợ UTF-8/BOM, header Anh/Việt, metadata và `<1` theo importer hiện có.
+3. **Inference mặc định TẮT**, thu thập mạng luôn TẮT trong UI này. Nếu muốn Ollama, chọn cả **Cho phép Ollama inference** và checkbox xác nhận dùng tài nguyên máy; model mặc định `qwen3:4b-instruct`. Không có gọi model để kiểm tra model đã cài. Chỉ worker xử lý job có quyền đã lưu mới được chạy inference.
+4. Bấm **Kiểm tra CSV & xem trước**: contract và importer kiểm tra cục bộ. CSV sai keyword/vùng, nhiều keyword hoặc URL không hợp lệ bị chặn. Không có collector HTTP/inference ở bước này. Preview ghi rõ filename gốc, keyword, vùng trong CSV, vùng yêu cầu, URL do người dùng khai báo, số dòng, giá trị gốc và SHA-256. URL **chưa được xác minh độc lập** là URL đã export; vùng không có trong header được ghi là không có, không tự coi là metadata đã xác thực.
+5. Đọc preview rồi bấm **Gửi yêu cầu đã xem trước**. Nếu sửa form, phải kiểm tra lại để thay preview; nút gửi luôn dùng snapshot đã hiển thị. Input hash được kiểm tra lại trước khi enqueue và ở worker. Rerun/upload/refresh/navigation không tự submit.
+
+Upload lưu byte nguyên gốc trong `<input-root>/.marketlens-uploads/<UUID>.csv` cùng sidecar JSON chứa filename gốc cho hiển thị. Không dùng filename client làm đường dẫn; không ghi đè; giới hạn 32 MiB, `.csv`, UTF-8, chặn credential/control content và symlink/junction/traversal. Thư mục upload được Git ignore cả khi input root là repository. Worker đọc relative input path trong request immutable và root đã lưu trong DB; file còn dùng được sau khi đóng browser/Streamlit. Worker copy input vào bundle riêng, đối chiếu SHA-256; các artifact không phụ thuộc session. Sidecar filename chỉ để hiển thị, không phải provenance được nguồn xác thực. Các upload preview chưa submit hoặc bị từ chối có thể còn trong workspace; chưa có tự dọn file, tránh xóa input của job đang chờ.
+
+Chống trùng nằm trong transaction SQLite của API submit: cùng request + cùng input hash (bỏ qua UUID filename) dùng lại job đã lưu, kể cả terminal. Job QUEUED/RUNNING cùng chủ đề (không phân biệt hoa thường), input hash, mode và URL cũng được dùng lại dù model/quyền vừa chọn khác; UI nhắc phải đọc quyền/model **của job đã lưu**, không nâng quyền job cũ. Không replay inference tự động. Muốn chủ động chạy lại request giống hệt sau khi thất bại/gián đoạn, dùng CLI `submit-research` với quyền rõ như mục M3.2; UI hiện không có retry. Không có khái niệm fuzzy similarity ngoài các trường này.
+
+### Theo dõi, lịch sử và tải báo cáo
+
+**Đồng bộ workspace (M3.3.2):** monitor và lịch sử dùng native Streamlit fragments riêng (Streamlit >=1.66). Khi có job đang chờ/chạy, cập nhật theo nhịp **2,5 giây**, đọc state thật từ SQLite; không rerun form, preview, submit hoặc worker. Monitor xác minh bundle và hiện kết quả **ngay trong nhịp phát hiện COMPLETED**, không chờ nhịp 30 giây. Nếu bundle thiếu/lỗi, thử tối đa **3 lần**, rồi giữ thông báo chặn tải; **Làm mới trạng thái** khởi tạo lại lượt xác minh theo yêu cầu người dùng. Không tự chạy lại nghiên cứu.
+
+Sau terminal, monitor giữ snapshot cuối và ngừng query nhanh. Lịch sử chỉ đọc tối đa 200 job mỗi nhịp nhanh khi snapshot còn job active; khi tất cả terminal, ngừng các query nhanh. Fragment cha nhịp **30 giây** loại timer con đã xong, đọc lại state và phát hiện job mới từ CLI. **Làm mới trạng thái / Làm mới lịch sử** vẫn có sẵn. Lựa chọn job và draft form được giữ qua các fragment refresh. Browser nền có thể throttle timer; không cam kết thời gian thực.
+
+**Hiển thị và tải xuống tách biệt:** snapshot kết quả đã xác minh được cache trong session (tối đa 3 phiên), ràng buộc với DB, artifact root, request, outcome và result reference. Fingerprint manifest + metadata file dùng để phát hiện thay đổi, không thay thế kiểm định checksum. Khi cache thay đổi, bundle được xác minh lại. Mỗi nút download dùng deferred callback: chạy verifier gốc trên toàn bộ bundle, hash lại bytes thực và so với bản đang xem trước khi trả dữ liệu. File thiếu, symlink/traversal, checksum sai hoặc bytes đổi so với bản xem sẽ chặn download. Không inject HTML report vào UI. Cache chỉ phục vụ trình bày, không đổi validator hoặc trạng thái JobStore.
+
+**Bố cục workspace:** setup chia nhóm nguồn/quyền chạy; preview gom filename, keyword, vùng, số quan sát, checksum và provenance; một nút gửi chính và nút mở monitor sau submit. Monitor ưu tiên chủ đề, execution/validation riêng và tiến độ checkpoint; ID đầy đủ, timestamps, worker, source URL, quyền và lỗi nằm trong audit mở rộng. Kết quả theo thứ tự tổng quan → nội dung từ report → bằng chứng → downloads → audit. No-inference không trình bày generic fallback như ý tưởng AI mới; INVALID không được trình bày như kết luận đã đạt. Lịch sử desktop rút gọn metadata, mobile dùng card/phân trang 10 phiên, vẫn truy cập đủ tối đa 200 phiên và full ID trong chi tiết. CSS chỉ áp dụng khi workspace hiện diện; năm trang gốc giữ thiết kế hiện có.
+
+`QUEUED` nghĩa chưa được worker nhận, không chứng minh worker đang tắt; dashboard không đo heartbeat. Nếu worker offline, polling vẫn có giới hạn mỗi 2,5 giây, không retry job hoặc busy loop. Xem hướng dẫn terminal B nếu queue chưa được xử lý. Monitor hiển thị sáu state, phase thực, checkpoint x/8, số lần thực thi, thời gian UTC, quyền, provenance, ID có nút copy và lỗi an toàn. Hủy QUEUED kết thúc ngay trong DB; hủy RUNNING là yêu cầu hợp tác, HTTP/Ollama cần trả về/timeout và tới checkpoint. Hủy và làm mới chỉ cập nhật fragment; INTERRUPTED không tự chạy lại. Reload lấy state từ DB; URL giữ lựa chọn job, không giữ raw CSV trong URL.
+
+Lịch sử hiển thị tối đa 200 job mới nhất (gồm TEST/SMOKE nếu có), không đọc golden artifacts thành job giả. Chọn job rồi **Xem chi tiết job**, mở tab **Theo dõi job**. Execution `COMPLETED` và validation `VALID/DEGRADED/INVALID/...` hiển thị riêng. `VALID` không chứng minh nhu cầu mua; index Google Trends không phải search volume, sales hoặc market size. No-inference thường tạo phân tích deterministic với `DEGRADED`.
+
+Chỉ research job `COMPLETED` với persisted reference đúng và manifest hợp lệ mới có kết quả: kiểm tra containment, symlink/junction, request/outcome, toàn bộ bundle checksum qua verifier hiện có, rồi đối chiếu hash byte thực được tải. Cho tải Markdown/HTML/JSON nguyên gốc; không inject report HTML vào dashboard. Thiếu file, checksum sai hoặc reference lỗi làm chặn tải cả bundle với thông báo. `_partial`, output chưa commit DB và các job terminal khác không trở thành báo cáo hoàn tất. File trên đĩa cần được bảo vệ bằng quyền local OS; dashboard local không phải sandbox chống người có quyền sửa đồng thời filesystem/SQLite.
+
+### QA M3.3 trên Windows
+
+- Dùng workspace trống riêng theo hai terminal trên: thấy empty state, năm trang cũ vẫn vào được; không có job trước khi bấm gửi. Dừng worker, upload/preview/gửi để thấy QUEUED; làm mới và F5 không tạo thêm job. Bật worker để job được nhận. Kiểm tra cùng DB bằng `python -m market_research.jobs list` từ terminal B.
+- Dùng CSV thật của bạn và URL export thật. Thử URL sai keyword/vùng, thiếu CSV, CSV nhiều keyword, file lớn; không được enqueue. No-inference trước, chỉ tự chọn inference khi muốn dùng Ollama; lượt triển khai này không chạy inference hoặc live collection.
+- Hủy QUEUED và RUNNING; với RUNNING chờ checkpoint/timeout. Chọn job cũ từ lịch sử, sao chép ID, F5 giữ lựa chọn. Xem execution/validation riêng; tải ba reports và so SHA-256 trong manifest. Không xem HTML report bên trong app.
+- Không bấm F5: khi worker hoàn tất, monitor phải hiện kết quả theo nhịp ngắn; lịch sử phải tự đổi từ QUEUED sang COMPLETED cùng validation. Giữ một draft chưa submit và lựa chọn lịch sử trong lúc polling, thử cả hai nút refresh thủ công. Với file report bị hỏng trong workspace thử riêng, tải phải bị chặn; không sửa artifact lịch sử để làm QA.
+- Edge/Chrome `F12` → `Ctrl+Shift+M`: **1440×1000, 1024×900, 768×1024, 390×844**, zoom 100% và 125%. Kiểm tra đóng/mở sidebar; form, checkbox xác nhận, nút preview/submit, ba tab, bảng cuộn ngang, ID copy và tải report. Tab bar có thể cuộn ngang trên màn hình hẹp. Dùng cửa sổ InPrivate để kiểm tra sidebar `auto` chưa có preference cũ. AppTest không thay thế việc kiểm tra clipping/điều hướng bằng browser.
+
+Tests workspace mới ở `tests/test_research_workspace.py` dùng CSV **SYNTHETIC TEST FIXTURE**, DB/root tạm, chặn services. Chạy focused hoặc full:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_research_workspace.py -q
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Pytest tự loại bỏ mọi biến `MARKETLENS_*` kế thừa trong fixture autouse; mỗi test cần override phải tự đặt bằng `monkeypatch` và root tạm. Cấu hình ứng dụng trong terminal không ảnh hưởng DB/input/artifacts của test hoặc subprocess của test. JobStore vẫn từ chối artifact/input root không khớp settings đã lưu. Có thể chạy full suite ngay từ terminal đang dùng ba biến cấu hình workspace ở trên; các biến đó được khôi phục sau fixture và không bị xóa khỏi terminal của người dùng.
+
+### Artifact publication stability gate — M3.3.3
+
+Gate vẫn **PARTIAL** cho đến khi xác định được nguyên nhân hai lỗi `INVALID_RESULT` không ổn định đã quan sát ở M3.3.2. Các ca là `test_replay_empty_input_finishes_honestly_without_fake_evidence` và `test_download_reverifies_all_files_even_when_display_snapshot_exists` (lỗi trong helper chuẩn bị job). Cả hai ở `READY_TO_PUBLISH`, 8/8 checkpoint, chưa có `result_path`; staging bundle xác minh được khi đọc lại. Các lượt chạy lại thành công không chứng minh lỗi đã được sửa.
+
+Luồng hiện tại: tạo và đóng các file trong `_partial` → chốt manifest/SHA-256 → xác minh bundle → checkpoint 8/8 → transaction SQLite kiểm tra owner/lease/cancellation → xác minh lại → rename `_partial` thành `result` → ghi state/reference/outcome → commit. Rename và SQLite commit không phải một transaction filesystem chung: lỗi SQL sau rename có thể để lại `result` trên đĩa nhưng job chưa COMPLETED. Verifier của workspace vẫn chặn đọc/tải khi persisted state/reference không hợp lệ; không tự replay job.
+
+`tests/test_publication_stability.py` kiểm tra offline bằng input **SYNTHETIC**: handle file thật trên Windows có thể gây `PermissionError` khi rename thư mục; đóng handle rồi bundle vẫn hợp lệ nhưng job không được tự hồi sinh. Đây là một cơ chế tái tạo triệu chứng, **chưa xác nhận là nguyên nhân hai lỗi cũ**. Tests cũng kiểm tra rename lỗi, transaction SQLite lỗi sau rename, worker cạnh tranh và cancellation/interruption trước publication. Không đổi validator, checksum, lease hoặc semantics terminal để làm test pass. Không thêm retry publication/inference khi chưa đủ bằng chứng.
+
+Chạy nhóm gate trên Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_publication_stability.py tests/test_research_jobs.py tests/test_jobs.py -q
+```
+
+Để lặp đúng hai ca cũ có giới hạn và giữ fixture/log từng lượt trong thư mục Git ignore (dừng ngay nếu lỗi):
+
+```powershell
+New-Item -ItemType Directory -Path .tmp\publication-gate -Force | Out-Null
+1..40 | ForEach-Object {
+    $gateRun = $_
+    .\.venv\Scripts\python.exe -m pytest -q --tb=short `
+        tests/test_research_jobs.py::test_replay_empty_input_finishes_honestly_without_fake_evidence `
+        tests/test_research_workspace.py::test_download_reverifies_all_files_even_when_display_snapshot_exists `
+        "--basetemp=.tmp/publication-gate/run-$gateRun" 2>&1 |
+        Tee-Object -FilePath ".tmp\publication-gate\run-$gateRun.txt"
+    if ($LASTEXITCODE -ne 0) { throw "Publication gate failed at iteration $gateRun; preserve its artifacts." }
+}
+```
+
+Không sửa/xóa historical artifacts để điều tra; không coi `result` có mặt trên đĩa hoặc checkpoint 8/8 là bằng chứng job đã công bố thành công. Giữ fixture lỗi để chẩn đoán operation/exception gốc; không log payload, exception text nhạy cảm hoặc credential. Full pytest vẫn phải chạy ở cả cấu hình không override và cấu hình có ba biến workspace.
 
 ## Dashboard Streamlit — Milestone 2.5
 

@@ -6,7 +6,8 @@ import json
 import signal
 import threading
 
-from .job_store import DEFAULT_DATABASE, JobState, JobStore, JobStoreError, ResearchInputError
+from .job_store import JobState, JobStoreError, ResearchInputError
+from .job_config import open_job_store
 from .job_worker import Worker
 
 
@@ -18,7 +19,7 @@ class SafeParser(argparse.ArgumentParser):
 
 def main(argv=None) -> int:
     parser = SafeParser(description="Persistent local smoke and explicitly authorized single-niche research jobs")
-    parser.add_argument("--db", default=str(DEFAULT_DATABASE), help="SQLite database path; defaults to ignored outputs/jobs")
+    parser.add_argument("--db", help="SQLite path; otherwise MARKETLENS_JOBS_DB or ignored outputs/jobs")
     parser.add_argument("--artifact-dir", help="Fixed artifact root for this DB; defaults to <db-directory>/artifacts")
     parser.add_argument("--input-root", help="Allowed local input directory; persisted per DB, defaults to repository root")
     commands = parser.add_subparsers(dest="command", required=True, parser_class=SafeParser)
@@ -48,7 +49,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "worker" and not 0.1 <= args.poll_seconds <= 60:
             raise ValueError("Invalid polling interval")
-        store = JobStore(args.db, artifact_root=args.artifact_dir, input_root=args.input_root)
+        store = open_job_store(args.db, artifact_root=args.artifact_dir, input_root=args.input_root)
         exit_code = 0
         if args.command == "submit-smoke":
             result = store.submit("smoke", {"steps": args.steps}).model_dump(mode="json")

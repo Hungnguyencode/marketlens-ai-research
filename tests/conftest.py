@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 from datetime import date, timedelta
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,18 @@ from market_research.openlibrary_collector import OpenLibraryCollector
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def clear_marketlens_environment(monkeypatch):
+    """Application settings must never leak into offline tests or child processes."""
+    for name in list(os.environ):
+        if name.startswith("MARKETLENS_"):
+            monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def isolated_marketlens_environment(monkeypatch):
+    clear_marketlens_environment(monkeypatch)
 
 
 def write_synthetic_google_trends_csv(path):

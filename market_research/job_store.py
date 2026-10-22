@@ -217,7 +217,8 @@ class JobStore:
         fields["research_outcome"] = ResearchOutcome.model_validate_json(raw_outcome) if raw_outcome else None
         return Job.model_validate(fields)
 
-    def submit(self, job_type: str, payload: dict | None = None, *, job_id: str | None = None) -> Job:
+    def submit(self, job_type: str, payload: dict | None = None, *, job_id: str | None = None,
+               deduplicate: bool = False, expected_input_sha256: str | None = None) -> Job:
         if job_type not in {"smoke", "research"}:
             raise ValueError("Only explicitly registered smoke and research job types are available.")
         try:
@@ -233,8 +234,23 @@ class JobStore:
                     message = str(exc)
                 raise ResearchInputError("Research request unavailable: " + message) from None
             raise ValueError("Invalid smoke request: only integer steps between 1 and 5 are accepted.") from None
+        if expected_input_sha256 is not None and (
+                job_type != "research" or request.input_sha256 != expected_input_sha256):
+            raise ResearchInputError("Input changed after preview; validate again before submission.")
         job_id = validate_id(uuid4().hex if job_id is None else job_id)
         with self._connection(write=True) as db:
+            if deduplicate and job_type == "research":
+                # Atomic across browser sessions. UUID upload names do not change identity.
+                signature = request.model_dump(exclude={"input_path"})
+                for row in db.execute("SELECT * FROM jobs WHERE job_type='research' ORDER BY created_at DESC,job_id DESC"):
+                    previous = self._job(row)
+                    prior = previous.request.model_dump(exclude={"input_path"})
+                    same_input = all(prior[key] == signature[key] for key in
+                                     ("mode", "input_sha256", "source_url"))
+                    same_topic = prior["topic"].casefold() == signature["topic"].casefold()
+                    if prior == signature or (same_input and same_topic and previous.state in
+                                               {JobState.QUEUED, JobState.RUNNING}):
+                        return previous
             db.execute("""INSERT INTO jobs (job_id,job_type,request_json,state,created_at,phase,
                 completed_steps,total_steps) VALUES (?,?,?,'QUEUED',?,'QUEUED',0,?)""",
                 (job_id, job_type, request.model_dump_json(), self._stamp(self._now()),

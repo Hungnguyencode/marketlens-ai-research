@@ -12,7 +12,7 @@ from market_research.dashboard_ui import show_ai_insights, show_overview, show_k
 
 SOURCE_DIRECTORY = Path(__file__).resolve().parent
 REPOSITORY = Path(os.environ.get("MARKETLENS_ARTIFACTS_DIR", SOURCE_DIRECTORY)).resolve()
-PAGES = ["Tổng quan", "Phân tích từ khóa", "Khám phá niche", "Đánh giá cơ hội", "Bằng chứng & truy vết"]
+PAGES = ["Tổng quan", "Phân tích từ khóa", "Khám phá niche", "Đánh giá cơ hội", "Bằng chứng & truy vết", "Không gian nghiên cứu"]
 
 
 @st.cache_data(ttl=10, max_entries=4, show_spinner=False)
@@ -130,6 +130,10 @@ def show_audit(store, index, batch, comparison, fingerprint):
 
 def select_page(page):
     st.session_state["page"] = page
+    if page == "Không gian nghiên cứu":
+        st.query_params["workspace"] = "research"
+    elif "workspace" in st.query_params:
+        del st.query_params["workspace"]
 
 
 def main():
@@ -141,12 +145,16 @@ def main():
     st.html("<style>" + (SOURCE_DIRECTORY / "dashboard.css").read_text(encoding="utf-8") + "</style>")
     st.sidebar.html('<div class="ml-brand">Market<span>Lens</span></div><div class="ml-brand-sub">EVIDENCE-FIRST RESEARCH</div>')
     if st.session_state.get("page") not in PAGES:
-        st.session_state["page"] = PAGES[0]
+        st.session_state["page"] = PAGES[-1] if st.query_params.get("workspace") == "research" else PAGES[0]
     st.sidebar.html('<div class="ml-sidebar-label">KHÔNG GIAN NGHIÊN CỨU</div>')
     for name in PAGES:
         st.sidebar.button(name, key="nav-" + name, width="stretch",
             type="primary" if st.session_state["page"] == name else "secondary", on_click=select_page, args=(name,))
     page = st.session_state["page"]
+    if page == "Không gian nghiên cứu":
+        from market_research.dashboard_workspace import show_workspace
+        show_workspace()
+        return
     try:
         store = ArtifactStore(REPOSITORY)
         fingerprint = store.fingerprint()

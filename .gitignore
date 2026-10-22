@@ -27,6 +27,7 @@ htmlcov/
 .tmp/
 data/*.csv
 outputs/
+.marketlens-uploads/
 snapshots/
 logs/
 
