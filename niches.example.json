@@ -1,0 +1,30 @@
+{
+  "catalog_limit": 10,
+  "request_timeout_seconds": 15,
+  "niches": [
+    {
+      "niche_id": "cozy-adults",
+      "name": "cozy coloring books for adults",
+      "intended_audience": "Người lớn thích tô màu chủ đề cozy (đối tượng dự kiến, chưa xác minh nhu cầu)",
+      "catalog_query": "cozy coloring book"
+    },
+    {
+      "niche_id": "bold-easy",
+      "name": "bold and easy coloring books",
+      "intended_audience": "Người thích nét đậm, tranh dễ tô (đối tượng dự kiến, chưa xác minh nhu cầu)",
+      "catalog_query": "bold and easy coloring books"
+    },
+    {
+      "niche_id": "christmas-adults",
+      "name": "Christmas coloring books for adults",
+      "intended_audience": "Người lớn thích tô màu chủ đề Giáng sinh (đối tượng dự kiến, chưa xác minh nhu cầu)",
+      "catalog_query": "Christmas coloring books for adults"
+    },
+    {
+      "niche_id": "kids-christmas",
+      "name": "kids Christmas activity books",
+      "intended_audience": "Trẻ em với người lớn hướng dẫn hoạt động Giáng sinh (đối tượng dự kiến, chưa xác minh nhu cầu)",
+      "catalog_query": "kids Christmas activity books"
+    }
+  ]
+}

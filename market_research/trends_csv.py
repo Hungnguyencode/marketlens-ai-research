@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -9,6 +10,34 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .models import Evidence
+
+
+SYNTHETIC_CSV_MARKER = "SYNTHETIC DEMO ONLY — NOT REAL MARKET EVIDENCE"
+SYNTHETIC_SOURCE = "urn:marketlens:synthetic-demo"
+SYNTHETIC_NOTICE = "SYNTHETIC — dữ liệu demo được tạo, không phải Google Trends export hoặc bằng chứng thị trường thật."
+
+
+def is_synthetic_csv(raw: bytes) -> bool:
+    """Recognize the demo generator's explicit marker, never a filename or topic."""
+    return any(line.strip() == SYNTHETIC_CSV_MARKER for line in raw.decode("utf-8-sig").splitlines())
+
+
+def validate_csv_provenance(raw: bytes, source: str) -> bool:
+    synthetic = is_synthetic_csv(raw)
+    if synthetic != (source == SYNTHETIC_SOURCE):
+        raise ValueError("SYNTHETIC demo CSV requires urn:marketlens:synthetic-demo, never a Google Trends URL; the identifier requires the demo marker.")
+    return synthetic
+
+
+def is_synthetic_evidence(item) -> bool:
+    row = item if isinstance(item, dict) else item.model_dump()
+    return (row.get("source_url") == SYNTHETIC_SOURCE
+            or row.get("metric_name") == "synthetic_demo_index"
+            or row.get("raw_observation", {}).get("data_provenance") == "SYNTHETIC")
+
+
+def is_synthetic_result(result) -> bool:
+    return result.metadata.get("data_provenance") == "SYNTHETIC" or any(map(is_synthetic_evidence, result.evidence))
 
 
 class GoogleTrendsCsvCollector:
@@ -55,10 +84,12 @@ class GoogleTrendsCsvCollector:
             return None
 
     def collect(self, *, run_id: str, niche: str, keyword: str, target_region: str) -> list[Evidence]:
-        self._validate_source_url()
+        raw = self.csv_path.read_bytes()
+        synthetic = validate_csv_provenance(raw, self.source_url)
+        if not synthetic:
+            self._validate_source_url()
         # Google Trends chart exports commonly include a short metadata preamble and UTF-8 BOM.
-        with self.csv_path.open("r", encoding="utf-8-sig", newline="") as source_file:
-            rows = list(csv.reader(source_file))
+        rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
         header_index = next((i for i, row in enumerate(rows)
             if row and self._normalized_header(row[0]) in self.date_headers and len(row) > 1), None)
         if header_index is None:
@@ -84,16 +115,21 @@ class GoogleTrendsCsvCollector:
                 digest = hashlib.sha256(f"{run_id}|{self.name}|{series_keyword}|{period}".encode("utf-8")).hexdigest()[:16]
                 evidence.append(Evidence(
                     evidence_id=f"{run_id}-{digest}", run_id=run_id, niche=niche,
-                    keyword=series_keyword or keyword, source_name=self.source_name, source_url=self.source_url,
+                    keyword=series_keyword or keyword,
+                    source_name="SYNTHETIC demo CSV (generated; NOT market evidence)" if synthetic else self.source_name,
+                    source_url=self.source_url,
                     collected_at=collected_at, target_region=target_region, observation_period=period,
-                    metric_name="search_interest_index", metric_value=metric_value,
-                    metric_unit="Google Trends relative index (0-100; not absolute search volume)",
-                    source_excerpt=f"{period_column} {period}: {raw_value}",
+                    metric_name="synthetic_demo_index" if synthetic else "search_interest_index", metric_value=metric_value,
+                    metric_unit="SYNTHETIC demo index (generated; not measured search interest)" if synthetic else
+                                "Google Trends relative index (0-100; not absolute search volume)",
+                    source_excerpt=("SYNTHETIC · " if synthetic else "") + f"{period_column} {period}: {raw_value}",
                     raw_observation={"period_column": period_column, "period": period,
                         "series_column": header[column_index], "raw_value": raw_value,
                         "geographic_metadata": self._geography_from_header(header[column_index]),
-                        "csv_filename": self.csv_path.name},
-                    extraction_method="User-provided Google Trends chart CSV import; manual export, not autonomous collection",
+                        "csv_filename": self.csv_path.name,
+                        **({"data_provenance": "SYNTHETIC", "synthetic_marker": SYNTHETIC_CSV_MARKER} if synthetic else {})},
+                    extraction_method=SYNTHETIC_NOTICE if synthetic else
+                                      "User-provided Google Trends chart CSV import; manual export, not autonomous collection",
                     collection_status="success" if metric_value is not None else "partial"))
         if not evidence:
             raise ValueError("Google Trends CSV contained no time-series observations")

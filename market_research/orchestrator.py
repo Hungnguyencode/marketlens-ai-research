@@ -18,7 +18,8 @@ from .reports import write_reports
 from .store import EvidenceStore
 from .tools import ToolRegistry
 from .validator import validate_analysis
-from .trends_csv import GoogleTrendsCsvCollector
+from .trends_csv import (GoogleTrendsCsvCollector, SYNTHETIC_SOURCE, SYNTHETIC_NOTICE,
+                         is_synthetic_evidence)
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
         collector = GoogleBooksCollector(config.request_timeout_seconds, os.getenv("GOOGLE_BOOKS_API_KEY"),
                                          **({"checkpoint": check} if execution else {}))
     registry = ToolRegistry({collector.name: collector.collect})
-    inference_allowed = execution is None or execution.allow_inference
+    inference_allowed = (execution is None or execution.allow_inference) and source_url != SYNTHETIC_SOURCE
     ollama = (OllamaClient(config.ollama_base_url, config.model, config.ollama_timeout_seconds,
                           **({"checkpoint": check} if execution else {})) if inference_allowed else None)
     planner = AgentPlanner(registry.available_tools, llm=ollama.plan if mode == "live" and ollama else None)
@@ -116,6 +117,16 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
                     str(details), time.perf_counter()-step_started)
         check()
         store = EvidenceStore(snap_path); store.save(evidence)
+    synthetic_flags = [is_synthetic_evidence(item) for item in evidence]
+    synthetic = source_url == SYNTHETIC_SOURCE or any(synthetic_flags)
+    if synthetic:
+        if not all(synthetic_flags) or any(item.source_url != SYNTHETIC_SOURCE
+                or item.metric_name != "synthetic_demo_index" or not item.source_name.startswith("SYNTHETIC")
+                for item in evidence):
+            raise ValueError("SYNTHETIC demo provenance is inconsistent or mixed with genuine research evidence.")
+        inference_allowed = False
+        ollama = None
+        logger.step("data_provenance", "EvidenceStore", "success", SYNTHETIC_NOTICE)
     quota_403 = collection_errors and all(e.get("status_code") == 403 and
         any(term in (str(e.get("reason", "")) + " " + str(e.get("message", ""))).lower()
             for term in ("quota", "limit", "rate")) for e in collection_errors)
@@ -131,7 +142,7 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
     if execution and mode != "live":
         if len({item.keyword.casefold().strip() for item in evidence}) > 1 or len({item.niche for item in evidence}) > 1:
             raise ValueError("A single-niche research job requires one local keyword series and niche.")
-        if mode == "csv_import" and evidence:
+        if mode == "csv_import" and evidence and source_url != SYNTHETIC_SOURCE:
             declared = parse_qs(urlparse(source_url).query).get("q", [])
             normalize = GoogleTrendsCsvCollector._normalized_header
             if len(declared) != 1 or normalize(declared[0]) != normalize(evidence[0].keyword):
@@ -185,6 +196,8 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
             analysis_error = "Ollama operation failed; sensitive details withheld." if execution else f"{type(exc).__name__}: {exc}"
             logger.step("analyze_evidence", "OllamaClient", "unavailable", "deterministic low-confidence fallback",
                 analysis_error, time.perf_counter()-analysis_started)
+    if synthetic:
+        analysis.factual_observations = [fact.description for fact in verified_facts]
     progress("CLAIM_VALIDATION", 5)
     evidence_dicts = [e.model_dump(mode="json") for e in evidence]
     normalize_analysis_keywords(analysis, evidence_dicts)
@@ -233,6 +246,8 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
     logger.step("validate_analysis", "EvidenceValidator", validation.status.lower(),
         f"status={validation.status}; schema_valid={validation.schema_valid}; evidence_sufficient={validation.evidence_sufficient}",
         duration=time.perf_counter()-validation_started)
+    if synthetic:
+        validation.warnings.append(SYNTHETIC_NOTICE)
     finished = datetime.now(timezone.utc)
     result = ResearchResult(run_id=run_id, niche=niche, category=config.category, target_region=config.target_region,
         report_language=config.report_language, mode=mode, started_at=started, finished_at=finished, evidence=evidence,
@@ -255,6 +270,8 @@ def run_research(config: ResearchConfig, niche: str, mode="live", replay_path: s
     if execution:
         result.metadata.update(execution.metadata)
         result.metadata["snapshot_path"] = snap_path.relative_to(execution.root).as_posix()
+    if synthetic:
+        result.metadata.update(data_provenance="SYNTHETIC", collection_method="synthetic_demo_csv")
     progress("REPORT_GENERATION", 6)
     report_started = time.perf_counter()
     paths = write_reports(result, output_dir)

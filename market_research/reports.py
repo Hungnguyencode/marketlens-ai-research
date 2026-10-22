@@ -1,35 +1,15 @@
 import json
+import re
 from pathlib import Path
 
 from .analysis import build_verified_facts
 from .models import ResearchResult
+from .trends_csv import SYNTHETIC_NOTICE, SYNTHETIC_SOURCE, is_synthetic_result
 
 
-def render_markdown(result: ResearchResult) -> str:
-    analysis = result.analysis
-    evidence = result.evidence
-    evidence_by_id = {item.evidence_id: item for item in evidence}
-    facts = result.verified_facts or build_verified_facts([item.model_dump(mode="json") for item in evidence])
-    facts_by_id = {fact.fact_id: fact for fact in facts}
-    measured = {item.keyword.casefold() for item in evidence}
-
-    def text(claim):
-        return claim.text if hasattr(claim, "text") else str(claim)
-
-    def refs(fact_ids):
-        return ", ".join(f"`{fact_id}`" for fact_id in fact_ids) or "không có fact ID"
-
-    trend_vi = {"increasing": "tăng", "stable": "ổn định", "decreasing": "giảm", "insufficient evidence": "chưa đủ dữ kiện"}
-    status_vi = {"VALID": "HỢP LỆ", "DEGRADED": "SUY GIẢM", "INSUFFICIENT_EVIDENCE": "CHƯA ĐỦ BẰNG CHỨNG",
-        "BLOCKED": "BỊ CHẶN", "INVALID": "KHÔNG HỢP LỆ"}
-    mode_vi = {"live": "thu thập tự động", "replay": "phát lại snapshot", "csv_import": "nạp CSV thủ công"}
-
+def trend_summaries(result):
     metrics = result.metadata.get("computed_metrics", [])
-    lines = [f"# Báo cáo nghiên cứu: {result.niche}", "", "## Tóm tắt điều hành",
-        f"- Trạng thái kiểm định: **{status_vi[result.validation.status]}**.",
-        f"- Bằng chứng nguồn: {len(evidence)} bản ghi; phân tích: {result.metadata.get('analysis_provenance', 'N/A')}."]
-    if result.validation.status == "INVALID":
-        lines.append("- Không có phát biểu phân tích nào của Ollama được chấp nhận làm kết luận; xem phụ lục chẩn đoán.")
+    summaries = []
     if metrics:
         for metric in metrics:
             recent, previous = metric.get("recent_window") or {}, metric.get("previous_window") or {}
@@ -41,17 +21,22 @@ def render_markdown(result: ResearchResult) -> str:
                 fluctuates = any(b < a for a, b in zip(recent_points, recent_points[1:])) and any(
                     b > a for a, b in zip(recent_points, recent_points[1:]))
                 fluctuation_note = "; dữ liệu dao động giữa các tuần" if fluctuates else ""
-                lines.append(f"- Với **{keyword}**, trung bình chỉ số tương đối của bốn tuần gần nhất "
+                summaries.append((keyword, f"Với {keyword}, trung bình chỉ số tương đối của bốn tuần gần nhất "
                     f"({recent.get('start_period')}–{recent.get('end_period')}: {recent.get('average_relative_index')}) "
                     f"{change_word} giai đoạn bốn tuần trước ({previous.get('start_period')}–{previous.get('end_period')}: "
                     f"{previous.get('average_relative_index')}) {abs(delta)} điểm{fluctuation_note}. Đây là so sánh hai cửa sổ, "
-                    "không khẳng định tăng liên tục theo tuần, xu hướng dài hạn, doanh số hay sức mua.")
+                    "không khẳng định tăng liên tục theo tuần, xu hướng dài hạn, doanh số hay sức mua."))
             else:
-                lines.append(f"- Chỉ số cho **{keyword}**: {metric.get('reason', 'chưa đủ dữ liệu để so sánh hai cửa sổ')}.")
+                summaries.append((keyword, f"Chỉ số cho {keyword}: {metric.get('reason', 'chưa đủ dữ liệu để so sánh hai cửa sổ')}."))
     else:
-        lines.append("- Chưa có metric xu hướng tính được từ dữ liệu.")
+        summaries.append(("", "Chưa có metric xu hướng tính được từ dữ liệu."))
 
-    lines += ["", "## Keyword và phạm vi đo lường"]
+    return summaries
+
+
+def keyword_groups(result):
+    analysis = result.analysis
+    measured = {item.keyword.casefold() for item in result.evidence}
     primary_keywords = []
     candidate_keywords = list(analysis.keyword_research_candidates)
     for keyword in analysis.main_keywords + analysis.related_keywords:
@@ -60,11 +45,52 @@ def render_markdown(result: ResearchResult) -> str:
                 primary_keywords.append(keyword)
         elif keyword.casefold() not in {x.casefold() for x in candidate_keywords}:
             candidate_keywords.append(keyword)
+    return primary_keywords, candidate_keywords
+
+
+def render_html(result: ResearchResult) -> str:
+    from .html_report import render_report
+    return render_report(result, trend_summaries(result), *keyword_groups(result))
+
+
+def render_markdown(result: ResearchResult) -> str:
+    analysis = result.analysis
+    evidence = result.evidence
+    facts = result.verified_facts or build_verified_facts([item.model_dump(mode="json") for item in evidence])
+    synthetic = is_synthetic_result(result)
+
+    def source(item):
+        return item.source_name if item.source_url == SYNTHETIC_SOURCE else f"[{item.source_name}]({item.source_url})"
+
+    def text(claim):
+        return claim.text if hasattr(claim, "text") else str(claim)
+
+    def refs(fact_ids):
+        return ", ".join(f"`{fact_id}`" for fact_id in fact_ids) or "không có fact ID"
+
+    status_vi = {"VALID": "HỢP LỆ", "DEGRADED": "SUY GIẢM", "INSUFFICIENT_EVIDENCE": "CHƯA ĐỦ BẰNG CHỨNG",
+        "BLOCKED": "BỊ CHẶN", "INVALID": "KHÔNG HỢP LỆ"}
+    mode_vi = {"live": "thu thập tự động", "replay": "phát lại snapshot", "csv_import": "nạp CSV thủ công"}
+    if synthetic:
+        mode_vi[result.mode] = "CSV demo SYNTHETIC"
+
+    lines = [f"# Báo cáo nghiên cứu: {result.niche}", "", "## Tóm tắt điều hành",
+        f"- Trạng thái kiểm định: **{status_vi[result.validation.status]}**.",
+        f"- Bằng chứng nguồn: {len(evidence)} bản ghi; phân tích: {result.metadata.get('analysis_provenance', 'N/A')}."]
+    if synthetic:
+        lines.insert(2, "> **" + SYNTHETIC_NOTICE + "**")
+    if result.validation.status == "INVALID":
+        lines.append("- Không có phát biểu phân tích nào của Ollama được chấp nhận làm kết luận; xem phụ lục chẩn đoán.")
+    lines.extend("- " + (paragraph.replace(keyword, f"**{keyword}**", 1) if keyword else paragraph)
+                 for keyword, paragraph in trend_summaries(result))
+
+    lines += ["", "## Keyword và phạm vi đo lường"]
+    primary_keywords, candidate_keywords = keyword_groups(result)
     if primary_keywords:
         for keyword in primary_keywords:
             matching = [item for item in evidence if item.keyword.casefold() == keyword.casefold()]
             first = matching[0]
-            lines.append(f"- **{keyword}** — {len(matching)} quan sát; nguồn: [{first.source_name}]({first.source_url}).")
+            lines.append(f"- **{keyword}** — {len(matching)} quan sát; nguồn: {source(first)}.")
     else:
         lines.append("- Chưa có keyword được đo trực tiếp.")
     lines.append("- Keyword ứng viên chưa đo (không phải tín hiệu trending/popular): " +
@@ -86,7 +112,9 @@ def render_markdown(result: ResearchResult) -> str:
             lines.append("- Không có diễn giải bổ sung.")
     else:
         lines += ["", "## Kết quả đã xác minh", "- Chỉ các fact do Python tính từ evidence gốc bên dưới được trình bày như dữ kiện.",
-            "- Diễn giải của Ollama đang bị loại khỏi kết luận vì kiểm định claim chưa đạt."]
+            ("- Chưa yêu cầu phân tích Ollama; không có kết luận AI mới."
+             if result.metadata.get("analysis_execution_status") == "not_requested" else
+             "- Diễn giải của Ollama đang bị loại khỏi kết luận vì kiểm định claim chưa đạt.")]
 
     lines += ["", "## Giới hạn dữ liệu",
         f"- Chế độ: {mode_vi[result.mode]}; collection: {result.metadata.get('live_collection_status', 'N/A')}; "
@@ -115,7 +143,7 @@ def render_markdown(result: ResearchResult) -> str:
     lines.extend(f"- `{fact.fact_id}` — {fact.description}; evidence IDs: {', '.join(fact.evidence_ids) or 'none'}; "
         f"metric IDs: {', '.join(fact.metric_ids) or 'none'}." for fact in facts)
     lines += ["", "### Evidence gốc"]
-    lines.extend(f"- `{item.evidence_id}` — [{item.source_name}]({item.source_url}); {item.keyword}; "
+    lines.extend(f"- `{item.evidence_id}` — {source(item)}; {item.keyword}; "
         f"{item.metric_name}={item.metric_value} {item.metric_unit or ''}; kỳ={item.observation_period}; "
         f"{item.source_excerpt or ''}" for item in evidence)
     lines.append("")
@@ -123,14 +151,15 @@ def render_markdown(result: ResearchResult) -> str:
 
 
 def write_reports(result: ResearchResult, output_dir: str | Path) -> dict[str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", result.run_id):
+        raise ValueError("Unsafe report run ID.")
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    stem = f"{result.run_id}-{result.niche.replace(' ', '-')[:50]}"
+    slug = re.sub(r"[^\w.-]+", "-", result.niche.replace(" ", "-"))[:50].strip(".-") or "research"
+    stem = f"{result.run_id}-{slug}"
     md, html, js = out / f"{stem}.md", out / f"{stem}.html", out / f"{stem}.json"
     content = render_markdown(result)
     md.write_text(content, encoding="utf-8")
-    escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html.write_text(f"<!doctype html><meta charset='utf-8'><title>Market Research</title>"
-        f"<pre style='white-space:pre-wrap;font:16px system-ui'>{escaped}</pre>", encoding="utf-8")
+    html.write_text(render_html(result), encoding="utf-8")
     js.write_text(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2), encoding="utf-8")
     return {"markdown": str(md), "html": str(html), "json": str(js)}

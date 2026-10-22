@@ -12,7 +12,7 @@ from .job_store import JobState, JobStore, JobStoreError
 from .models import ResearchResult
 from .research_contract import (SECRET_PATTERN, ResearchRequest, ResearchSubmission,
                                 prepare_request, resolve_input, verify_bundle)
-from .trends_csv import GoogleTrendsCsvCollector
+from .trends_csv import GoogleTrendsCsvCollector, SYNTHETIC_SOURCE, is_synthetic_csv
 
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 
@@ -78,6 +78,10 @@ def preview_upload(store: JobStore, filename: str, raw: bytes, *, topic: str, so
     if allow_inference and not inference_confirmed:
         raise WorkspaceError("Cần xác nhận riêng trước khi cho phép Ollama inference.")
     try:
+        if is_synthetic_csv(raw):
+            if source_url.strip() not in {"", SYNTHETIC_SOURCE} or allow_inference:
+                raise WorkspaceError("SYNTHETIC demo: để trống URL nguồn và tắt inference; không dùng URL Google Trends cho dữ liệu được tạo.")
+            source_url = SYNTHETIC_SOURCE
         submission = ResearchSubmission(topic=topic, mode="csv_import", input_path="pending.csv",
                                         source_url=source_url, model=model, allow_network=False,
                                         allow_inference=allow_inference)
@@ -90,8 +94,9 @@ def preview_upload(store: JobStore, filename: str, raw: bytes, *, topic: str, so
             run_id="workspace-preview", niche=topic, keyword=topic, target_region="United States")
         normalize = GoogleTrendsCsvCollector._normalized_header
         keywords = {normalize(row.keyword) for row in rows}
-        declared = parse_qs(urlparse(source_url).query)["q"][0]
-        if len(keywords) != 1 or normalize(declared) not in keywords:
+        declared = parse_qs(urlparse(source_url).query).get("q", [])
+        if len(keywords) != 1 or (source_url != SYNTHETIC_SOURCE and
+                                 (len(declared) != 1 or normalize(declared[0]) not in keywords)):
             raise WorkspaceError("CSV phải có đúng một keyword và khớp q trong URL nguồn.")
         geographies = {row.raw_observation.get("geographic_metadata", "") for row in rows}
         if any(value and normalize(value) not in {"us", "united states", "hoa kỳ"} for value in geographies):

@@ -14,6 +14,7 @@ from .research_workspace import (WorkspaceError, original_filename, preview_uplo
 from .workspace_design import (STATE_LABELS, VALIDATION_LABELS, PHASE_LABELS, PROVENANCE_LABELS,
                                job_header, section_header, summary_grid, history_cards)
 from .workspace_state import ResultSnapshot, MAX_VERIFICATION_ATTEMPTS, verified_download
+from .trends_csv import SYNTHETIC_NOTICE, SYNTHETIC_SOURCE, is_synthetic_result
 
 ACTIVE_STATES = {JobState.QUEUED, JobState.RUNNING}
 ACTIVE_REFRESH_SECONDS = 2.5
@@ -65,7 +66,7 @@ def show_new_research(store):
             st.subheader("Nguồn dữ liệu")
             uploaded = st.file_uploader("CSV Google Trends (UTF-8, tối đa 32 MiB)", type=["csv"], max_upload_size=32)
             source_url = st.text_input("URL Google Trends thực tế đã dùng để xuất CSV",
-                                       help="HTTPS, geo=US, q khớp keyword. Không nhập token hoặc mật khẩu.")
+                                       help="CSV thật: HTTPS, geo=US, q khớp keyword. Demo từ create_synthetic_demo.py: để trống URL, tắt inference. Không nhập token hoặc mật khẩu.")
             st.caption("United States · import cục bộ. Index 0–100 là mức quan tâm tương đối, không phải doanh số hoặc search volume.")
         with execution:
             st.subheader("Tùy chọn thực thi")
@@ -94,20 +95,23 @@ def show_new_research(store):
     if preview is None:
         return
     request = preview.request
+    synthetic = request.source_url == SYNTHETIC_SOURCE
     st.html(section_header("Kiểm tra nguồn & xác nhận", "Bản xem trước đã chốt; kiểm tra lại nếu bạn sửa form.", "02"))
+    if synthetic:
+        st.warning(SYNTHETIC_NOTICE)
     with st.container(border=True, key="workspace-input-summary"):
         st.html(summary_grid([("File gốc", preview.filename), ("Keyword", preview.keyword),
                               ("Vùng trong CSV", preview.geography), ("Phạm vi", "United States"),
                               ("Quan sát", len(preview.observations)), ("Toàn vẹn input", "Đã chốt SHA-256")]))
         st.caption("Keyword trong file: " + preview.keyword)
-        st.caption("URL chưa được xác minh độc lập là URL xuất file; đã đối chiếu keyword và vùng cục bộ.")
+        st.caption(SYNTHETIC_NOTICE if synthetic else "URL chưa được xác minh độc lập là URL xuất file; đã đối chiếu keyword và vùng cục bộ.")
         with st.expander("URL nguồn & checksum input"):
-            st.text("URL do người dùng cung cấp: " + request.source_url)
+            st.text(("Định danh demo nội bộ (không phải URL nguồn): " if synthetic else "URL do người dùng cung cấp: ") + request.source_url)
             st.code(request.input_sha256, language=None, wrap_lines=True)
         with st.expander("Xem trước quan sát · tối đa 10 dòng", expanded=True):
             st.dataframe(preview.observations[:10], hide_index=True, width="stretch")
             st.caption("Giữ nguyên ngày và giá trị CSV, kể cả <1. Không suy ra lượng tìm kiếm tuyệt đối.")
-        st.html(summary_grid([("Yêu cầu sẽ gửi", request.topic), ("Nguồn", "Google Trends CSV thủ công"),
+        st.html(summary_grid([("Yêu cầu sẽ gửi", request.topic), ("Nguồn", "SYNTHETIC demo CSV" if synthetic else "Google Trends CSV thủ công"),
                               ("Inference", "BẬT · đã xác nhận" if request.allow_inference else "TẮT"),
                               ("Thu thập mạng", "TẮT"), ("Model", request.model)]))
         if st.button("Gửi yêu cầu đã xem trước", key="workspace-submit", type="primary"):
@@ -144,6 +148,8 @@ def show_result(store, job):
     verified = snapshot.verified
     result = verified.result
     outcome = job.research_outcome
+    if is_synthetic_result(result):
+        st.warning(SYNTHETIC_NOTICE)
     st.html(section_header("Kết quả đã công bố", "Kết quả workflow và kiểm định được trình bày riêng; không xác nhận nhu cầu mua."))
     with st.container(key="workspace-result-summary"):
         kpis([("Thực thi", STATE_LABELS[job.state], job.state.value),
@@ -173,6 +179,8 @@ def show_result(store, job):
         st.caption("Research run ID")
         st.code(result.run_id, language=None, wrap_lines=True)
         st.text(f"Analysis provenance: {outcome.analysis_provenance}\nModel execution: {outcome.model_execution_status}\nModel yêu cầu: {outcome.requested_model}")
+        if is_synthetic_result(result):
+            st.text(SYNTHETIC_NOTICE)
         st.caption("Bản hiển thị đã kiểm tra lúc " + time_label(snapshot.checked_at)
                    + ". Download luôn xác minh lại bytes; không nhúng HTML report vào trang.")
         for source in dict.fromkeys(item.source_url for item in result.evidence):
@@ -211,7 +219,9 @@ def show_evidence(result, job_id):
     st.html(section_header("Khám phá bằng chứng", "Quan sát nguyên gốc; index tương đối không phải lượng tìm kiếm tuyệt đối hoặc doanh số."))
     keywords = ", ".join(dict.fromkeys(item.keyword for item in result.evidence))
     st.caption(f"{keywords} · {result.target_region} · {len(result.evidence)} quan sát")
-    if result.mode == "csv_import":
+    if is_synthetic_result(result):
+        st.warning(SYNTHETIC_NOTICE)
+    elif result.mode == "csv_import":
         st.caption("Google Trends CSV thủ công · URL do người dùng khai báo, chưa được xác minh độc lập.")
     full = st.checkbox("Xem toàn bộ quan sát", key=f"workspace-all-evidence-{job_id}", value=False)
     rows = result.evidence if full else result.evidence[:10]

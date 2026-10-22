@@ -64,6 +64,13 @@ def test_portable_example_reports_missing_csv_and_batch_with_actionable_errors(t
         load_comparison_config(local_config)
 
 
+def test_joint_import_rejects_demo_marker_instead_of_labeling_it_real(context):
+    from market_research.trends_csv import SYNTHETIC_CSV_MARKER
+    raw = (SYNTHETIC_CSV_MARKER + "\n" + context.csv_path.read_text(encoding="utf-8-sig")).encode("utf-8-sig")
+    with pytest.raises(ValueError, match="SYNTHETIC"):
+        parse_comparison(context, csv_bytes=raw)
+
+
 def synthetic_csv(config, values):
     config.period_start = date(2024, 1, 7)
     config.period_end = config.period_start + timedelta(weeks=len(values) - 1)

@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, parse_qsl, urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .models import ResearchResult
-from .trends_csv import GoogleTrendsCsvCollector
+from .trends_csv import GoogleTrendsCsvCollector, SYNTHETIC_SOURCE, validate_csv_provenance
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -62,6 +62,10 @@ class ResearchSubmission(BaseModel):
         if self.mode == "csv_import":
             if not self.source_url:
                 raise ValueError("csv_import requires the actual Google Trends export page URL.")
+            if self.source_url == SYNTHETIC_SOURCE:
+                if self.allow_inference:
+                    raise ValueError("SYNTHETIC demo imports cannot authorize inference.")
+                return self
             try:
                 GoogleTrendsCsvCollector("unused.csv", self.source_url)._validate_source_url()
                 url = urlparse(self.source_url)
@@ -127,7 +131,10 @@ def prepare_request(payload: dict, root: Path) -> ResearchRequest:
     checksum = None
     if submission.mode != "live":
         path = resolve_input(root, submission.input_path, submission.mode)
-        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        raw = path.read_bytes()
+        if submission.mode == "csv_import":
+            validate_csv_provenance(raw, submission.source_url)
+        checksum = hashlib.sha256(raw).hexdigest()
         data["input_path"] = path.relative_to(root).as_posix()
     return ResearchRequest(**data, input_sha256=checksum)
 

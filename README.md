@@ -1,8 +1,84 @@
-# Evidence-First AI Market Research Agent
+# MarketLens — Evidence-First Market Research
+
+
+## MarketLens trong một phút
+
+MarketLens giúp người nghiên cứu sách/niche, người làm sản phẩm và người học AI kiểm tra **bằng chứng đang có, điều có thể diễn giải và điều chưa biết**. Luồng chính: nhập CSV Google Trends thủ công → xem trước nguồn → gửi job bền vững → worker độc lập xử lý → kiểm định claim → đọc và tải báo cáo có provenance.
+
+- **Research Workspace:** upload UTF-8/BOM, kiểm tra keyword/vùng/checksum, quyền Ollama tường minh, SQLite jobs, hủy hợp tác, monitor/history tự cập nhật và tải report đã xác minh.
+- **Năm trang analytics:** tổng quan, keyword, niche, cơ hội, bằng chứng/audit; cần batch/comparison artifacts của chính bạn. Clone mới có empty state trung thực.
+- **Engine:** fact binding do Python, kiểm tra claim và báo cáo Markdown/HTML/JSON. HTML mới là tài liệu ngữ nghĩa, stylesheet tự chứa và liên kết nguồn an toàn; các report đã xuất trước đó không bị viết lại.
+- **Nguồn:** Trends CSV đo mức quan tâm tương đối; Open Library/Google Books cung cấp metadata thư mục. Không có verified Amazon sales, thu thập Google Trends realtime hoặc xác nhận product-market fit.
+
+### Kiến trúc và ranh giới thực thi
+
+```mermaid
+flowchart LR
+    CSV[CSV do người dùng cung cấp] --> UI[Streamlit Workspace]
+    UI --> DB[(SQLite jobs)]
+    DB --> W[Worker độc lập]
+    W --> E[Research Engine]
+    E --> V[Evidence / Claim Validator]
+    V --> R[Markdown · HTML · JSON + manifest/SHA-256]
+    R --> UI
+    O[Ollama local · opt-in] <--> E
+```
+
+Polling chỉ đọc trạng thái; không submit, khởi động worker hoặc gọi model. Execution COMPLETED và validation VALID/DEGRADED/INVALID là hai kết quả khác nhau. VALID không chứng minh nhu cầu mua, lợi nhuận hoặc market fit. Cấu hình `.env` không tự được nạp; các terminal phải dùng cùng process environment cho DB/input/artifacts.
+
+### Quick start Windows — không cần Ollama hoặc dữ liệu riêng
+
+Yêu cầu Python 3.11+. Chạy từ thư mục clone:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,dashboard,dashboard-test]"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m streamlit run .\dashboard.py
+```
+
+`requirements.txt` cài app với dashboard; extras `dev,dashboard-test` bổ sung pytest và renderer chart cho full suite không skip. Cài dependency cần package index được phép hoặc wheelhouse phù hợp; app không tải dependency khi chạy. Không cần activate PowerShell script. Nếu chỉ muốn xem UI, bỏ bước pytest. Mở `http://127.0.0.1:8501/?workspace=research`; năm trang analytics trống khi chưa có batch hợp lệ.
+
+### Demo offline có nhãn SYNTHETIC
+
+Không cần CSV riêng, snapshot lịch sử, database có sẵn hoặc Ollama. Tạo **thư mục mới**; script từ chối ghi đè:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\create_synthetic_demo.py --directory .\outputs\SYNTHETIC-mentor-demo
+```
+
+Chạy cùng khối cấu hình trong **cả hai terminal** (script tạo CSV chỉ chạy một lần):
+
+```powershell
+$demoRoot = Join-Path $PWD 'outputs\SYNTHETIC-mentor-demo'
+$env:MARKETLENS_JOBS_DB = Join-Path $demoRoot 'jobs.sqlite3'
+$env:MARKETLENS_INPUT_ROOT = Join-Path $demoRoot 'inputs'
+$env:MARKETLENS_JOB_ARTIFACT_ROOT = Join-Path $demoRoot 'artifacts'
+```
+
+Terminal A: `.\.venv\Scripts\python.exe -m streamlit run .\dashboard.py`.
+Terminal B, **sau khi gửi job**: `.\.venv\Scripts\python.exe -m market_research.jobs worker --once`.
+
+Trong Workspace, đặt topic **SYNTHETIC mentor demo**, upload `outputs/SYNTHETIC-mentor-demo/inputs/SYNTHETIC-google-trends.csv`, **để trống URL nguồn** và giữ cả hai checkbox inference OFF. Preview nhận marker trong nội dung CSV và gán định danh nội bộ `urn:marketlens:synthetic-demo` (không phải URL, không tạo source link). Không dựng URL Google Trends cho dữ liệu demo. Preview → gửi một lần → mở monitor. Nếu chưa chạy terminal B, QUEUED là đúng. Sau worker, xem execution và validation riêng, `<1`, history, audit và tải HTML. Preview, evidence, reports và audit đều gắn nhãn SYNTHETIC; metric demo riêng không tính thành search-interest signal hoặc evidence đủ cho nghiên cứu thật. Inference demo bị chặn; không trộn demo và evidence thật trong replay/batch/comparison.
+
+Phân biệt demo dựa trên marker chính xác `SYNTHETIC DEMO ONLY — NOT REAL MARKET EVIDENCE` cùng định danh nội bộ, không dựa vào tên file/chủ đề. CSV thật vẫn bắt buộc URL Google Trends hợp lệ, keyword và vùng khớp. Marker và SHA-256 bảo vệ cách phân loại/input đã gửi, không xác thực tính chân thực của CSV do người dùng tự soạn. Report demo cũ dùng tên nguồn Google Trends/URL dựng lại **không phải bằng chứng thị trường thật**; giữ nguyên artifact/checksum lịch sử, tạo job mới để có provenance đúng.
+
+Để tạo batch rỗng trung thực cho clone mới, dùng `python -m market_research.multi_niche --config niches.example.json --no-ollama`. File `niches.json` hiện giữ mapping CSV local có sẵn; không giả định file đó tồn tại trên clone. Joint comparison cần export chung thật và batch tương thích theo `comparison.example.json`; không so trực tiếp các CSV normalize riêng.
+
+### Ollama tùy chọn
+
+Chỉ cần khi bạn chủ động bật inference. Cài/chạy Ollama theo hướng dẫn chính thức của nhà cung cấp và chuẩn bị model `qwen3:4b-instruct`; không cần model cho tests, empty state hoặc demo OFF. Workspace chỉ dùng loopback mặc định `http://localhost:11434`; không đổi binding hoặc mở cổng mạng. Đặt biến môi trường nếu cần, rồi chọn **cả hai** checkbox để ủy quyền cho đúng request. Chẩn đoán `python main.py --check-ollama` là **generation thật**, không thuộc kiểm tra offline.
+
+### Readiness, giới hạn và hướng dẫn demo
+
+Xem [ma trận nghiệm thu và demo mentor 3–5 phút](docs/RELEASE_READINESS.md). Rủi ro publication `FAILED/INVALID_RESULT` không ổn định còn **chưa xác định nguyên nhân**; không coi là đã sửa. Không blanket retry, tự replay inference hoặc nới checksum. Tất cả output/data/DB riêng được Git ignore; `TASK-1.md` và fixture checksum local không phải dữ liệu bắt buộc cho tests hoặc clone mới. Giữ chúng cục bộ; kiểm tra danh sách file trước khi công khai repository.
+
+Các mục tiếp theo là tài liệu chi tiết theo từng capability; thông tin run lịch sử là bằng chứng local, không đi kèm clone và không được dùng để giả lập AI Insights.
 
 ## Phạm vi hiện tại
 
-Repository hiện gồm research engine cho niche đơn, tích hợp Ollama và kiểm định claim, Open Library collector, batch/comparison bốn niche cùng dashboard Streamlit năm trang. Chỉ run lịch sử cozy được lưu với provenance Ollama; batch/comparison bốn niche hiện không chạy inference và không đưa ra xếp hạng thương mại nếu thiếu evidence. Báo cáo tiếng Việt; keyword tiếng Anh.
+Repository hiện gồm research engine cho niche đơn, tích hợp Ollama và kiểm định claim, Open Library collector, batch/comparison bốn niche cùng dashboard Streamlit có năm trang analytics và Research Workspace. Run lịch sử cozy và các job được ủy quyền có thể có provenance Ollama; batch/comparison bốn niche hiện không chạy inference và không đưa ra xếp hạng thương mại nếu thiếu evidence. Báo cáo tiếng Việt; keyword tiếng Anh.
 
 ## Dữ liệu cục bộ và kiểm thử tái lập
 
@@ -58,7 +134,7 @@ Người dùng đã xác minh Open Library trên Windows: query `cozy coloring b
 
 ## Cấu hình và cài đặt Windows PowerShell
 
-Yêu cầu Python 3.11+, Ollama đang chạy trên Windows host, model `qwen3:4b-instruct` đã cài, và outbound access tới `www.googleapis.com`.
+Yêu cầu Python 3.11+. Ollama/model chỉ cần khi bật inference; outbound access chỉ cần cho collector được chủ động cho phép. Tests và Workspace no-inference không yêu cầu các dịch vụ này.
 
 ```powershell
 $repo = Join-Path $HOME "ai-market-research-agent"
@@ -66,7 +142,7 @@ Set-Location $repo
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,dashboard,dashboard-test]"
 ```
 
 Nếu PowerShell chặn activate script, có thể gọi trực tiếp `\.venv\Scripts\python.exe` và `\.venv\Scripts\pytest.exe`.
@@ -453,7 +529,7 @@ Không sửa/xóa historical artifacts để điều tra; không coi `result` c�
 
 ## Dashboard Streamlit — Milestone 2.5
 
-App duy nhất là [dashboard.py](dashboard.py), đọc artifacts có sẵn trong `outputs/`. Không tự chạy batch, collector, comparison generation hoặc Ollama; không ghi database hay sửa report. Giao diện dùng sidebar navy với navigation buttons, workspace sáng, KPI cards/status chips riêng và evidence flow phản ánh đúng execution. HTML từ artifact luôn escape; thiết kế nằm trong `dashboard.css`, màu sidebar dùng theme chính thức, không dùng JS hoặc selector class ngẫu nhiên. Cài dependency UI trên Windows (cần package index hoặc wheelhouse được phép), rồi khởi động từ repository:
+App duy nhất là [dashboard.py](dashboard.py). Năm trang analytics chỉ đọc artifacts có sẵn trong `outputs/`, không tự chạy batch, collector, comparison hoặc Ollama. Research Workspace lưu upload và request/job vào workspace SQLite theo thao tác người dùng; worker độc lập mới chạy nghiên cứu, không sửa report lịch sử. Giao diện dùng sidebar navy với navigation buttons, workspace sáng, KPI cards/status chips riêng và evidence flow phản ánh đúng execution. HTML từ artifact luôn escape; thiết kế nằm trong `dashboard.css`, màu sidebar dùng theme chính thức, không dùng JS hoặc selector class ngẫu nhiên. Cài dependency UI trên Windows (cần package index hoặc wheelhouse được phép), rồi khởi động từ repository:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[dashboard,dev]"

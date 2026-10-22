@@ -16,7 +16,7 @@ from uuid import uuid4
 from pydantic import Field, model_validator
 
 from .multi_niche import NICHE_KEYWORDS, NicheResult, StrictModel, _cell, _json, _normalized
-from .trends_csv import GoogleTrendsCsvCollector
+from .trends_csv import GoogleTrendsCsvCollector, validate_csv_provenance
 
 
 class ComparisonConfig(StrictModel):
@@ -153,6 +153,7 @@ def parse_comparison(config: ComparisonConfig, *, csv_bytes: bytes | None = None
     config = ComparisonConfig.model_validate(config.model_dump())
     raw = config.csv_path.read_bytes() if csv_bytes is None else csv_bytes
     try:
+        validate_csv_provenance(raw, config.source_url)
         rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline=""), strict=True))
     except (UnicodeError, csv.Error) as exc:
         raise ValueError("Comparison CSV is not valid UTF-8 CSV") from exc
