@@ -264,6 +264,47 @@ def test_all_persisted_states_and_cancellation_controls(runtime, state):
         assert not application.get("download_button")
 
 
+def test_publication_io_failure_stays_failed_in_monitor_history_and_download(runtime, monkeypatch):
+    job, _ = queued(runtime)
+    rename = Path.rename
+
+    def denied(path, target):
+        if path.name == "_partial" and Path(target).name == "result":
+            raise OSError(5, "SYNTHETIC private filesystem error")
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", denied)
+    with Worker(runtime) as worker:
+        failed = worker.run_once()
+    assert failed.state == JobState.FAILED and failed.error_code == "PUBLICATION_IO_FAILED"
+    application = app()
+    button(application, "Xem chi tiết job").click().run(timeout=20)
+    text = all_text(application)
+    assert not application.exception and "FAILED" in text and "PUBLICATION_IO_FAILED" in text
+    assert "SYNTHETIC private filesystem error" not in text
+    assert any("operation=rename; errno=5; winerror=None; attempts=1" in item.value for item in application.code)
+    assert not application.get("download_button")
+    history = runtime.list_jobs()
+    assert len(history) == 1 and history[0].job_id == job.job_id and history[0].state == JobState.FAILED
+    with pytest.raises(WorkspaceError):
+        verified_reports(runtime, job.job_id)
+
+
+def test_publication_diagnostics_never_render_arbitrary_exception_text(runtime):
+    import sqlite3
+    job, _ = queued(runtime)
+    owner = runtime.register_worker()
+    runtime.claim_next(owner)
+    runtime.finish(job.job_id, owner, JobState.FAILED, error_code="PUBLICATION_IO_FAILED")
+    with sqlite3.connect(runtime.database) as db:
+        db.execute("UPDATE jobs SET error_message=? WHERE job_id=?", ("SYNTHETIC private exception text", job.job_id))
+    application = app()
+    button(application, "Xem chi tiết job").click().run(timeout=20)
+    assert not application.exception and "SYNTHETIC private exception text" not in all_text(application)
+    assert all("SYNTHETIC private exception text" not in item.value for item in application.code)
+    assert not application.get("download_button")
+
+
 def test_history_selection_and_bad_id(runtime):
     first, _ = queued(runtime)
     second, _ = queued(runtime)

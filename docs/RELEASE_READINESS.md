@@ -2,7 +2,15 @@
 
 ## Kết luận và phạm vi
 
-**Local mentor demo: READY WITH WARNINGS**, khi sử dụng workspace thử riêng, gắn nhãn dữ liệu và có phương án mở report đã tạo nếu worker gặp lỗi. **Public GitHub release: chưa đề nghị công bố như một bản ổn định** trước khi đánh giá rủi ro publication và rà soát danh sách file/giấy phép/phụ thuộc. Đây không phải dịch vụ production hoặc hệ thống xác nhận nhu cầu thương mại.
+**Local mentor demo: READY**, khi sử dụng workspace thử riêng và gắn nhãn dữ liệu. **Public GitHub release: gate riêng của chủ repository**, cần duyệt diff, giấy phép và quyền chia sẻ dữ liệu. Đây không phải dịch vụ production hoặc hệ thống xác nhận nhu cầu thương mại.
+
+### P0 publication gate — 23/10/2026
+
+Lỗi tự phát được bắt trực tiếp tại rename `_partial → result`: `PermissionError`, errno 13, WinError 5, sau 8/8 checkpoint. Mã cũ gộp lỗi OS với invalid bundle và bỏ qua cơ hội phục hồi denial tạm thời. Bản vá chỉ retry rename Windows 5/32/33 tối đa 4 lần (tổng chờ 0,5 giây), kiểm tra bundle/target/owner mỗi lần, xác minh lại vị trí cuối cùng và live lease trước commit. Năm regression cases thất bại trên mã cũ đã được sửa; không đổi Evidence Validator, provenance, model hoặc SQLite schema. Không xác định hoặc suy đoán process OS gây denial.
+
+Focused: **208 passed**; crash/restart process thật: **1 passed**; full Windows: **491 passed**, không skip/deselect. Harness SYNTHETIC không chèn lỗi: **241/241 COMPLETED**, có một native WinError 5 được xử lý mà không chạy lại research. Lỗi I/O kéo dài vẫn FAILED/PUBLICATION_IO_FAILED; bundle không hợp lệ vẫn FAILED/INVALID_RESULT. Reference/manifest/checksum tiếp tục chặn download sai. Orphan sau lỗi SQLite/process crash không được tự công nhận hoặc replay; request thử lại phải có job/bundle mới. Không gọi live inference/collection; 24/24 historical hashes giữ nguyên.
+
+Các số liệu và cảnh báo publication trong phần M3.4 bên dưới là **biên bản lịch sử trước P0**, được giữ để truy vết; trạng thái publication hiện tại tham chiếu gate P0 và README. Hai incident M3.3.2 cũ thiếu exception trace nên không gán chắc chắn tác nhân cho chúng. Native reproduction có trace và regression/fault injection là bằng chứng của bản vá, không phải lời hứa filesystem không bao giờ thất bại.
 
 M3.4 bắt đầu từ checkpoint `8dfa254` trên `feature/interactive-research`. Không thay đổi sáu trang Streamlit, collector, validator hoặc worker. HTML exporter chỉ đọc các record đã có, escape text và tạo tài liệu tự chứa; JSON audit giữ đầy đủ record gốc. Các report lịch sử và SHA-256 đã công bố được giữ nguyên.
 

@@ -3,6 +3,7 @@ import streamlit as st
 from uuid import uuid4
 from functools import partial
 import hashlib
+import re
 from datetime import timezone
 
 from .dashboard_design import hero
@@ -292,6 +293,10 @@ def show_job_details(store, job):
         if job.error_code:
             st.warning((job.error_code if job.error_code in ERRORS else "JOB_ERROR") + ": "
                        + ERRORS.get(job.error_code, "Thực thi gặp lỗi; chi tiết nhạy cảm được giữ kín."))
+            if job.error_code == "PUBLICATION_IO_FAILED" and job.error_message:
+                diagnostic = job.error_message.removeprefix(ERRORS[job.error_code] + " ")
+                if re.fullmatch(r"operation=(rename|verify|reference); errno=(None|-?\d{1,10}); winerror=(None|-?\d{1,10}); attempts=[1-4]", diagnostic):
+                    st.code(diagnostic, language=None, wrap_lines=True)
         if job.state == JobState.QUEUED:
             with st.expander("Khởi chạy worker độc lập"):
                 st.caption("Dùng cùng cấu hình DB/input/artifacts trong terminal thứ hai. Dashboard không tạo worker.")

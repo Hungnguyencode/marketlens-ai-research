@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
+from time import sleep
 from typing import Literal
 from uuid import uuid4
 
@@ -72,6 +73,17 @@ class UnsafeArtifact(JobStoreError):
     pass
 
 
+class PublicationError(JobStoreError):
+    """Fixed operation and numeric OS diagnostics only; never persist exception text."""
+    def __init__(self, operation: str, error: OSError, attempts: int = 1):
+        if operation not in {"rename", "verify", "reference"} or type(attempts) is not int or not 1 <= attempts <= 4:
+            raise ValueError("Invalid publication diagnostic.")
+        numeric = lambda name: value if type(value := getattr(error, name, None)) is int else None
+        self.diagnostic = (f"operation={operation}; errno={numeric('errno')}; "
+                           f"winerror={numeric('winerror')}; attempts={attempts}")
+        super().__init__(self.diagnostic)
+
+
 class ResearchInputError(ValueError):
     """Only fixed schema/path diagnostics, safe to display through the CLI."""
 
@@ -84,7 +96,8 @@ def validate_id(value: str) -> str:
 
 ERRORS = {
     "HANDLER_FAILED": "Handler failed; exception contents are withheld to protect credentials.",
-    "INVALID_RESULT": "Handler did not return an existing, nonempty artifact inside its job directory.",
+    "INVALID_RESULT": "Result artifact is missing, unsafe, incomplete or inconsistent with its job or checksums.",
+    "PUBLICATION_IO_FAILED": "Filesystem publication failed; output remains unpublished. Review OS permissions or locks before a new explicit submission.",
     "WORKER_STOPPED": "Worker stopped before completion; review partial outputs before any new submission.",
     "LEASE_EXPIRED": "Worker lease expired; execution is interrupted and requires review. No automatic replay.",
     "RESEARCH_INPUT_FAILED": "Research input is missing, unsafe or changed since submission; no external work was authorized for changed data.",
@@ -362,14 +375,59 @@ class JobStore:
             raise UnsafeArtifact(ERRORS["INVALID_RESULT"])
         return path.relative_to(self.artifact_root).as_posix()
 
+    def _publish_research(self, db, job_id, worker_id, request, outcome, checkpoint):
+        directory = self.output_directory(job_id)
+        # Retry only the proven Windows access/sharing/lock errors at rename. Never
+        # replay research, retry invalid checksums or replace an existing target.
+        for attempt, delay in enumerate((0, 0.05, 0.15, 0.30), 1):
+            if checkpoint is not None:
+                checkpoint()
+            if delay:
+                sleep(delay)
+            if checkpoint is not None:
+                checkpoint()
+            self._owned(db, job_id, worker_id)
+            try:
+                verify_bundle(directory, job_id, request, outcome)
+            except OSError as exc:
+                if isinstance(exc, FileNotFoundError):
+                    raise UnsafeArtifact(ERRORS["INVALID_RESULT"]) from None
+                raise PublicationError("verify", exc, attempt) from None
+            self._owned(db, job_id, worker_id)
+            if (directory / "result").exists():
+                raise UnsafeArtifact(ERRORS["INVALID_RESULT"])
+            try:
+                (directory / "_partial").rename(directory / "result")
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in {5, 32, 33} and attempt < 4:
+                    continue
+                raise PublicationError("rename", exc, attempt) from None
+            # The final location, not just staging, must pass before SQLite can
+            # publish its reference. A failure leaves an unpublished orphan.
+            try:
+                verify_bundle(directory, job_id, request, outcome, directory_name="result")
+                reference = self._result_reference(job_id, "result/manifest.json")
+            except OSError as exc:
+                if isinstance(exc, FileNotFoundError):
+                    raise UnsafeArtifact(ERRORS["INVALID_RESULT"]) from None
+                raise PublicationError("verify", exc, attempt) from None
+            if checkpoint is not None:
+                checkpoint()
+            self._owned(db, job_id, worker_id)
+            return reference
+
     def finish(self, job_id: str, worker_id: str, state: JobState, *, result_path=None, error_code=None,
-               research_outcome: ResearchOutcome | None = None) -> Job:
+               research_outcome: ResearchOutcome | None = None, publication_error: PublicationError | None = None,
+               publication_checkpoint=None) -> Job:
         if state not in {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED, JobState.INTERRUPTED}:
             raise InvalidTransition("Worker can only finish a RUNNING job in a terminal state.")
-        if state == JobState.FAILED and error_code not in {"HANDLER_FAILED", "INVALID_RESULT",
+        if state == JobState.FAILED and error_code not in {"HANDLER_FAILED", "INVALID_RESULT", "PUBLICATION_IO_FAILED",
                 "RESEARCH_INPUT_FAILED", "RESEARCH_COLLECTION_FAILED", "RESEARCH_INFERENCE_FAILED",
                 "RESEARCH_CONFIGURATION_FAILED"}:
             raise ValueError("Failure requires a known safe error code.")
+        if publication_error is not None and (state != JobState.FAILED or error_code != "PUBLICATION_IO_FAILED"
+                                               or not isinstance(publication_error, PublicationError)):
+            raise ValueError("Publication diagnostics require a filesystem publication failure.")
         if state == JobState.INTERRUPTED:
             error_code = "WORKER_STOPPED"
         elif state != JobState.FAILED:
@@ -388,13 +446,9 @@ class JobStore:
                         try:
                             if result_path != "_partial/manifest.json" or research_outcome is None:
                                 raise ValueError("Missing prepared research outcome")
-                            directory = self.output_directory(job_id)
                             request = ResearchRequest.model_validate_json(row["request_json"])
-                            verify_bundle(directory, job_id, request, research_outcome)
-                            if (directory / "result").exists():
-                                raise ValueError("Publication target already exists")
-                            (directory / "_partial").rename(directory / "result")
-                            reference = self._result_reference(job_id, "result/manifest.json")
+                            reference = self._publish_research(db, job_id, worker_id, request, research_outcome,
+                                                               publication_checkpoint)
                         except (OSError, ValueError, KeyError, TypeError):
                             raise UnsafeArtifact(ERRORS["INVALID_RESULT"]) from None
             if state == JobState.CANCELLED and not row["cancellation_requested_at"]:
@@ -404,9 +458,12 @@ class JobStore:
             if row["job_type"] == "smoke" and research_outcome is not None:
                 raise ValueError("Smoke jobs cannot declare research outcomes.")
             phase = "PUBLICATION" if state == JobState.COMPLETED and row["job_type"] == "research" else row["phase"]
+            message = ERRORS.get(error_code)
+            if publication_error is not None:
+                message += " " + publication_error.diagnostic
             db.execute("""UPDATE jobs SET state=?,finished_at=?,result_path=?,error_code=?,error_message=?,outcome_json=?,phase=?
                 WHERE job_id=?""", (state, self._stamp(self._now()), reference, error_code,
-                                     ERRORS.get(error_code), research_outcome.model_dump_json() if research_outcome else None,
+                                     message, research_outcome.model_dump_json() if research_outcome else None,
                                      phase, job_id))
         return self.get(job_id)
 

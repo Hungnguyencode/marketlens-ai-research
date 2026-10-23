@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .job_store import (InvalidTransition, Job, JobState, JobStore, JobStoreError,
-                        SmokeRequest, StoreBusy, UnsafeArtifact)
+                        PublicationError, SmokeRequest, StoreBusy, UnsafeArtifact)
 from .research_contract import PreparedResearchResult, ResearchFailed, ResearchRequest
 
 
@@ -145,7 +145,8 @@ class Worker:
                 context.checkpoint()
                 if isinstance(result_path, PreparedResearchResult):
                     return self.store.finish(job.job_id, self.worker_id, JobState.COMPLETED,
-                                             result_path=result_path.result_path, research_outcome=result_path.outcome)
+                                             result_path=result_path.result_path, research_outcome=result_path.outcome,
+                                             publication_checkpoint=context.checkpoint)
                 return self.store.finish(job.job_id, self.worker_id, JobState.COMPLETED, result_path=result_path)
             except ResearchFailed as exc:
                 return self.store.finish(job.job_id, self.worker_id, JobState.FAILED,
@@ -154,6 +155,9 @@ class Worker:
                 return self.store.finish(job.job_id, self.worker_id, JobState.CANCELLED)
             except WorkerInterrupted:
                 return self._interrupted(job.job_id)
+            except PublicationError as exc:
+                return self.store.finish(job.job_id, self.worker_id, JobState.FAILED,
+                                         error_code="PUBLICATION_IO_FAILED", publication_error=exc)
             except UnsafeArtifact:
                 return self.store.finish(job.job_id, self.worker_id, JobState.FAILED, error_code="INVALID_RESULT")
             except (KeyboardInterrupt, SystemExit):

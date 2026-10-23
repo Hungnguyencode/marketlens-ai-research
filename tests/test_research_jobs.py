@@ -219,6 +219,31 @@ def test_ollama_timeout_retains_unpublished_diagnostics_and_safe_error(research,
     assert secret not in job.model_dump_json()
 
 
+def test_malformed_ollama_json_exhausts_existing_repair_without_publication(research, monkeypatch):
+    store, _, payload = research
+    requests = []
+
+    def malformed(request):
+        requests.append(request)
+        return httpx.Response(200, json={"response": "SYNTHETIC malformed JSON, not model evidence"})
+
+    client = httpx.Client(transport=httpx.MockTransport(malformed))
+    monkeypatch.setattr(OllamaClient, "analyze", PRODUCTION_ANALYZE)
+    monkeypatch.setattr("market_research.orchestrator.OllamaClient",
+                        lambda base, model, timeout, checkpoint: OllamaClient(base, model, timeout,
+                                                                              client=client, checkpoint=checkpoint))
+    queued = store.submit("research", {**payload, "allow_inference": True})
+    try:
+        job = execute(store)
+    finally:
+        client.close()
+    assert len(requests) == 2  # Existing bounded JSON repair; no publication/research replay.
+    assert job.state == JobState.FAILED and job.error_code == "RESEARCH_INFERENCE_FAILED"
+    assert job.research_outcome.model_execution_status == "failed" and job.result_path is None
+    assert job.research_outcome.validation_status != "VALID"
+    assert not (store.output_directory(queued.job_id) / "result").exists()
+
+
 def test_source_429_is_failed_execution_with_blocked_validation_and_sanitized_artifacts(research, monkeypatch):
     store, _, _ = research
 
