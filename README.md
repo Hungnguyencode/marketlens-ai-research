@@ -76,6 +76,38 @@ Xem [ma trận nghiệm thu và demo mentor 3–5 phút](docs/RELEASE_READINESS.
 
 Các mục tiếp theo là tài liệu chi tiết theo từng capability; thông tin run lịch sử là bằng chứng local, không đi kèm clone và không được dùng để giả lập AI Insights.
 
+## Báo cáo phân tích định lượng từ Google Trends CSV
+
+Báo cáo mới bổ sung executive findings, coverage/chất lượng dữ liệu, index gốc mới nhất và index số ở tuần hoàn tất mới nhất, trung bình hai cửa sổ 4 tuần, chênh lệch **điểm index**, min/max, biên độ, trung bình toàn tập, độ lệch chuẩn tổng thể (mẫu số N), thay đổi tuần lớn nhất và hình dạng chuỗi. Tất cả phép tính dùng source records, gắn `report_*` metric IDs, công thức và evidence IDs; không tin lại cached metrics hoặc lấy con số từ LLM. Markdown và HTML dùng chung phép tính `report_trends_v1`.
+
+- **OBSERVED FACT**, **INTERPRETATION**, **HYPOTHESIS** và research actions được tách rõ. Confidence chỉ mô tả chất lượng chuỗi, không xác nhận nhu cầu mua. Validation cũ giữ nguyên; report phong phú hơn vẫn có thể DEGRADED/INVALID.
+- Tuần được coi hoàn tất khi ngày cuối tuần **trước** ngày UTC của `finished_at` trong run. Dùng ngày run để tái lập, không dùng ngày mở report. Latest raw value có thể thuộc tuần chưa hoàn tất; report ghi rõ và không đưa nó vào averages.
+- `<1`, missing, NaN/Inf, giá trị ngoài 0–100 hoặc xung đột raw/numeric không được nội suy thành số. Không kéo các tuần cũ lên thay thế để lấp cửa sổ gần nhất bị thiếu. Ngày/ID trùng chặn aggregates; cửa sổ thiếu nhịp tuần hoặc ngày không theo thứ tự không được diễn giải hướng.
+- Chỉ phân tích chuỗi tuần từ Google Trends CSV có nguồn/keyword/vùng phù hợp; ngày/tháng, catalog và SYNTHETIC không được biến thành tín hiệu tuần thật. Các filename/export contexts được tách riêng, không gộp normalization.
+- **Competitive Landscape — Not Yet Verified:** chưa xác minh coverage đối thủ, giá, ratings/reviews, phản hồi khách hàng, conversion hoặc sales. P1 bị bỏ qua; không có Amazon scraper/dataset mới. Report đề xuất câu hỏi, evidence cần, lý do và quyết định nghiên cứu có thể hỗ trợ. Không khẳng định mùa vụ hoặc extrapolate doanh số.
+
+### Windows: tạo report MỚI từ CSV thật 53 tuần, inference OFF
+
+Chạy từ root repository. Kiểm tra `data/google-trends.csv` là CSV thật và `niches.json` ghi đúng URL đã dùng để export (không dựng URL cho dữ liệu tổng hợp). Dùng workspace mới để giữ report cũ và tránh mở lại kết quả cũ qua dedupe/UI:
+
+```powershell
+$repoRoot = (Get-Location).Path
+$reportRoot = Join-Path $repoRoot ('outputs\report-upgrade-' + [guid]::NewGuid().ToString('N'))
+$trends = (Get-Content .\niches.json -Raw -Encoding UTF8 | ConvertFrom-Json).niches[0].trends
+$jobArgs = @('--db', (Join-Path $reportRoot 'jobs.sqlite3'), '--artifact-dir', (Join-Path $reportRoot 'artifacts'), '--input-root', $repoRoot)
+
+.\.venv\Scripts\python.exe -m market_research.jobs @jobArgs submit-research --topic 'cozy coloring books for adults' --mode csv_import --input $trends.csv_path --source-url $trends.source_url
+.\.venv\Scripts\python.exe -m market_research.jobs @jobArgs worker --once
+.\.venv\Scripts\python.exe -m market_research.jobs @jobArgs list
+Get-ChildItem -LiteralPath (Join-Path $reportRoot 'artifacts') -Filter *.html -Recurse | Select-Object FullName
+```
+
+Không thêm `--allow-inference` hoặc `--allow-network` cho quy trình này. Mở HTML trong thư mục **result/reports** của job COMPLETED; không coi `_partial` là kết quả đã công bố. Đọc DEGRADED cùng các findings tính bằng Python, source links và audit; kiểm tra Ctrl+P trước khi nộp. Workspace này có DB riêng, không tự xuất hiện trong lịch sử của app đang dùng DB khác. Nếu muốn dùng Streamlit, khởi động lại app/worker trên cùng workspace rồi preview CSV thật, URL thật và tạo request mới với inference OFF. Không chạy `main.py --mode csv_import` để thử offline vì CLI legacy đó có thể gọi Ollama.
+
+Kiểm thử focused: `python -m pytest -q tests/test_report_intelligence.py tests/test_html_reports.py tests/test_engine.py tests/test_synthetic_provenance.py tests/test_portable_demo.py`. Full regression: `python -m pytest -q`. Fixtures là SYNTHETIC/unit-test-only, không đi kèm báo cáo nghiên cứu thật. Các output lịch sử không được render lại hoặc ghi đè bởi thay đổi exporter.
+
+QA upgrade ngày 23/10/2026: **160 focused tests passed; full suite 456 passed**, không skip/deselect. CSV local thật 53 quan sát đã tạo report mới qua CLI/worker riêng: COMPLETED 8/8, DEGRADED, inference not_requested; 52 tuần hoàn tất dùng được. Đây không phải lượt Ollama mới hoặc collection mạng. Kiểm tra hash bundle và 24 historical hashes đạt. Chưa thực hiện browser/print-preview QA mới cho bản nâng cấp này.
+
 ## Phạm vi hiện tại
 
 Repository hiện gồm research engine cho niche đơn, tích hợp Ollama và kiểm định claim, Open Library collector, batch/comparison bốn niche cùng dashboard Streamlit có năm trang analytics và Research Workspace. Run lịch sử cozy và các job được ủy quyền có thể có provenance Ollama; batch/comparison bốn niche hiện không chạy inference và không đưa ra xếp hạng thương mại nếu thiếu evidence. Báo cáo tiếng Việt; keyword tiếng Anh.

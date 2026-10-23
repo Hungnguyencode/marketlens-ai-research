@@ -697,7 +697,7 @@ def test_invalid_report_quarantines_model_claims_but_keeps_verified_facts(tmp_pa
             raw_observation=e["raw_observation"], extraction_method="test fixture", collection_status="success") for e in evidence],
         analysis=analysis, validation=ValidationResult(valid=False, status="INVALID", schema_valid=True,
             claims_valid=False, evidence_sufficient=True, unsupported_assertions=["fake fact ID rejected"]),
-        verified_facts=facts)
+        verified_facts=facts, metadata={"analysis_provenance": "ollama", "analysis_execution_status": "success"})
     report = __import__("pathlib").Path(write_reports(result, tmp_path)["markdown"]).read_text(encoding="utf-8")
     assert report.index("Tóm tắt điều hành") < report.index("Phụ lục kiểm toán")
     assert "Không có phát biểu phân tích nào của Ollama được chấp nhận" in report
